@@ -1,6 +1,6 @@
 # VaultWrite MCP
 
-独立运行的 Markdown 写入服务。多个 agent 连接同一个 HTTP MCP，强制检查内容版本，每次有效修改生成一条本地 Git 提交。无需运行 Obsidian。
+独立运行的 Markdown 写入服务。多个 agent 连接同一个 HTTP MCP，强制检查内容版本；默认逐次生成本地 Git 提交，也可配置定时批量提交、模型生成提交信息和自动 push。无需运行 Obsidian。
 
 这是可测试的 0.1 原型。支持 Linux/macOS、Python 3.11+ 和 Git，使用[官方 MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk/tree/v1.30.0)的 Streamable HTTP。
 
@@ -33,6 +33,55 @@ uv run vault-write-mcp serve --vault /path/to/test-vault --host 100.x.y.z --port
 
 用真实 IP 替换示例。客户端随后连接 `http://<该 IP>:18182/mcp`。Host 校验使用这个明确的地址；反向代理、浏览器跨域和公网 TLS 部署尚未配置。先使用隔离库测试。
 
+## 可配置的提交与模型调用
+
+不传 `--config` 时保持默认行为：每次有效写入立即提交 Git，模型调用和自动 push 均关闭。完整字段与默认值见 [`config.example.toml`](config.example.toml)。配置文件使用 Python 标准库读取，不引入 Agent SDK；HTTP 请求复用已有的 httpx。
+
+```sh
+uv run vault-write-mcp serve --vault /path/to/test-vault --config /path/to/vault-write.toml
+```
+
+| 配置 | 默认值 | 含义 |
+| --- | --- | --- |
+| `commit.mode` | `immediate` | `immediate` 逐次提交；`interval` 定时汇总提交 |
+| `commit.interval_seconds` | `300` | 批次提交与自动 push 的检查间隔，1–86400 秒 |
+| `model.enabled` | `false` | 开启模型生成 commit 信息 |
+| `model.api_url` / `model.model` | 空 | 完整 Chat Completions URL 与提供商模型名称 |
+| `model.api_key_env` | `VAULT_WRITE_MODEL_API_KEY` | 存放模型 API Key 的环境变量名称 |
+| `model.timeout_seconds` | `10` | HTTP 超时秒数 |
+| `model.max_diff_chars` | `12000` | 发给模型的 diff 字符上限，超出部分明确标记截断 |
+| `model.max_output_tokens` | `256` | 模型输出 token 上限 |
+| `model.token_limit_field` | `max_completion_tokens` | 旧兼容接口可使用 `max_tokens` |
+| `model.failure_policy` | `fallback` | `fallback` 使用默认信息；`defer` 失败后保留改动，等待下次尝试 |
+| `push.enabled` / `push.remote` | `false` / `origin` | 自动推送开关与已配置的 Git remote 名称 |
+| `push.branch` | 空 | 空值跟随当前分支，也可指定远端目标分支 |
+
+模型功能启用时，从配置指定的环境变量读取 Key；TOML 不接受明文 `api_key` 字段。服务的 `VAULT_WRITE_TOKEN` 与模型 API Key 是两份独立凭据。配置加载失败或开启模型但缺少 Key 时，启动会报错。修改配置后需重启服务。
+
+模型接口采用 [Chat Completions 格式](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)：只发送本次提交涉及的 diff，不发送整个知识库；每次有变化的提交尝试至多发一次 HTTP 请求，没有工具调用和自动 HTTP 重试。OpenAI 已将 `max_tokens` 标为弃用，默认使用 `max_completion_tokens`；其他兼容提供商按其支持情况配置。HTTP 重定向不会携带凭据继续访问。
+
+### 定时模式的确认与恢复
+
+将 `commit.mode` 设为 `interval`，可在一个周期内将多次修改汇总成一条提交。没有待提交变化或内容最终恢复原样时，不调用模型，也不创建空提交。若选择 `immediate` 并启用模型，每次有效写入都会调用一次模型。
+
+定时模式的写入仍在同库锁内强制校验版本、原子落盘并保存请求回执。写入成功返回 `pending: true, commit: null`，表示已持久保存，尚未生成 Git 提交；批次提交完成后，重放原请求会得到 `pending: false` 和批次提交号。请求最初返回的内容版本保留，批次 Git 历史只保存最终快照，周期内的中间版本不会各自形成提交。
+
+未提交数据与去重回执在重启后仍然保留；事务日志分别处理待提交写入和批次 Git 提交的中断。外部直接修改笔记、分支或暂存区会导致安全拒绝。切回逐次提交前须先 flush 待提交批次。可手动执行：
+
+```sh
+uv run vault-write-mcp flush --vault /path/to/test-vault --config /path/to/vault-write.toml
+```
+
+`flush` 不需要 MCP 鉴权令牌；它会按同一配置生成待提交批次，并在启用 push 时尝试推送。定时线程仅在 `serve` 期间运行，停止服务不会额外触发提交，下次启动后继续按周期检查。模型请求和 Git 操作期间会持有同库锁，较慢的接口会暂时延后其他读写。
+
+`failure_policy = "defer"` 时，模型失败不创建提交、不清除待提交批次，后台在下个周期再尝试；逐次模式则拒绝本次写入，文件保持原样。`fallback` 会使用默认信息继续提交。模型返回的内容只作为单行提交主题使用，不能执行 Git 或文件操作。
+
+### 自动 push
+
+启用前先在测试 Vault 配好 remote 与 Git 认证。服务只做普通 push，不 force、不 pull，不自动解决远端分歧。首次启用会推送当前 HEAD 及其历史；之后只有 HEAD 或推送目标发生变化时才推送。自动 push 的检查周期复用 `commit.interval_seconds`。
+
+成功推送的检查点保存在 `.git/vault-write/push.json`，重启后沿用。推送失败不会撤销本地提交，也不会重新调用模型生成信息；后台在下个周期重试。API Key 不参与 Git 认证。
+
 ## 工具
 
 | 工具 | 参数 | 行为 |
@@ -44,7 +93,7 @@ uv run vault-write-mcp serve --vault /path/to/test-vault --host 100.x.y.z --port
 
 现有笔记的版本形如 `sha256:<64 位小写十六进制>`，按原始 UTF-8 字节计算。创建新笔记也必须显式提交 `expected_version: "missing"`；它只能匹配真正不存在的文件。服务不提供 `blind`、强制覆盖或关闭版本校验的参数。BOM、CRLF 和末尾换行会原样保留。
 
-成功写入返回 `version`、`commit`、`changed`、`request_id` 和 `replayed`。正文没有变化时 `changed: false`，不会额外创建空提交。Git 提交只包含该笔记，提交正文记录 `VaultWrite-Actor` 和 `VaultWrite-Request`。
+逐次模式成功写入返回 `version`、`commit`、`changed`、`request_id` 和 `replayed`。正文没有变化时 `changed: false`，不会额外创建空提交。该模式的提交只包含该笔记，正文记录 `VaultWrite-Actor` 和 `VaultWrite-Request`；定时模式的批次提交记录涉及的 actor 和请求编号。
 
 `actor` 是调用方提供的审计标签，不是经过独立认证的用户身份。首版使用共享 bearer token。
 
@@ -94,10 +143,10 @@ git -C /tmp/vault-write-demo show <commit>:notes/example.md
 
 - 只管理相对 POSIX 路径下、可见目录中的 `.md` 文件；单篇及追加后的结果最多 1 MiB。拒绝目录穿越、隐藏路径、符号链接和嵌套仓库。
 - Vault 必须是本地普通 Git 仓库，有命名分支和至少一条提交。`init` 只接受全新或空目录。已有 Vault 应先完整备份，并在其隔离副本上测试。
-- 已有暂存修改会拒写；目标笔记与 HEAD 不一致或尚未跟踪时也会拒写，保留外部编辑。其他文件未暂存的修改和未跟踪文件会保留，不纳入服务提交。
+- 已有暂存修改会拒写；目标笔记有服务之外的未提交改动或尚未跟踪时也会拒写，保留外部编辑。定时模式只接纳本服务已登记的待提交内容。其他文件未暂存的修改和未跟踪文件会保留，不纳入服务提交。
 - 不支持 Git 内容过滤器或工作区编码转换、linked worktree、bare 仓库、Windows、NFS 或多机器直接共享文件锁。
 - **并发保证只覆盖统一通过本服务的写入。** Shell、编辑器、Obsidian、其他 MCP、Git pull/reset 和同步程序直接改同一副本会绕过锁。正式接管前需统一写入口并协调现有同步任务。
-- 首版只生成本地 Git 历史；没有自动 push/pull、正式库迁移、批量事务、删除、重命名和服务常驻配置。QMD 继续负责检索，写入前须通过本服务读取最新正文。
+- 自动 push 可按上述配置启用；没有自动 pull、正式库迁移、跨请求的批量原子写接口、删除、重命名和服务常驻配置。QMD 继续负责检索，写入前须通过本服务读取最新正文。
 
 ## 验证
 

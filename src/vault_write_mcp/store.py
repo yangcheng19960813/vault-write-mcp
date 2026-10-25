@@ -21,6 +21,9 @@ import subprocess
 import tempfile
 from typing import Iterator
 
+from .config import Settings
+from .messages import CommitMessages, MessageError
+
 
 class VaultError(Exception):
     def __init__(self, code: str, message: str, **details: object):
@@ -48,7 +51,9 @@ def _sync_directory(path: Path) -> None:
 class VaultStore:
     MAX_BYTES = 1024 * 1024
 
-    def __init__(self, root: str | Path):
+    def __init__(self, root: str | Path, settings: Settings | None = None):
+        self.settings = settings or Settings()
+        self.messages = CommitMessages(self.settings.model)
         self.root = Path(root).expanduser().resolve(strict=True)
         git_dir = self.root / ".git"
         if not git_dir.is_dir() or git_dir.is_symlink():
@@ -64,6 +69,8 @@ class VaultStore:
         with self._locked():
             with self._db() as db:
                 db.execute("CREATE TABLE IF NOT EXISTS receipts (request_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT NOT NULL)")
+                db.execute("CREATE TABLE IF NOT EXISTS pending (path TEXT PRIMARY KEY, state TEXT NOT NULL)")
+                db.execute("CREATE TABLE IF NOT EXISTS pending_requests (request_id TEXT PRIMARY KEY, path TEXT NOT NULL)")
             self._ref()
             self._head()
             self._recover()
@@ -76,6 +83,12 @@ class VaultStore:
             "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": os.devnull,
         })
+        if args and args[0] == "push":
+            # Git authentication and URL aliases often live in the user's config.
+            env.pop("GIT_CONFIG_GLOBAL")
+            for name in ("GIT_CONFIG_GLOBAL", "GIT_ASKPASS", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_SSH_VARIANT"):
+                if name in os.environ:
+                    env[name] = os.environ[name]
         if index is not None:
             env["GIT_INDEX_FILE"] = str(index)
         try:
@@ -190,6 +203,31 @@ class VaultStore:
     def _save_receipt(self, request_id: str, fingerprint: str, result: dict) -> None:
         with self._db() as db:
             db.execute("INSERT OR IGNORE INTO receipts VALUES (?, ?, ?)", (request_id, fingerprint, json.dumps(result)))
+            if result.get("pending"):
+                db.execute("INSERT OR IGNORE INTO pending_requests VALUES (?, ?)", (request_id, result["path"]))
+
+    def _pending_entries(self) -> list[dict]:
+        with self._db() as db:
+            return [json.loads(row[0]) for row in db.execute("SELECT state FROM pending ORDER BY path")]
+
+    def _pending_entry(self, path: str) -> dict | None:
+        with self._db() as db:
+            row = db.execute("SELECT state FROM pending WHERE path = ?", (path,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def _subject(self, diff: str, fallback: str) -> str:
+        try:
+            return self.messages.generate(diff, fallback)
+        except MessageError as exc:
+            raise VaultError("MODEL_ERROR", str(exc)) from exc
+
+    def flush(self) -> dict:
+        from .batch import flush
+        return flush(self)
+
+    def push(self) -> dict:
+        from .batch import push
+        return push(self)
 
     def _checkpoint(self, stage: str) -> None:
         """Overridden by failure-injection tests; no runtime bypass or failpoint."""
@@ -198,6 +236,10 @@ class VaultStore:
         if not self.journal.exists():
             return
         txn = json.loads(self.journal.read_text(encoding="utf-8"))
+        if txn.get("kind") in ("pending_write", "batch_commit"):
+            from .batch import recover_transaction
+            recover_transaction(self, txn)
+            return
         path = self._path(txn["path"])
         old = None if txn["old"] is None else base64.b64decode(txn["old"])
         new = base64.b64decode(txn["new"])
@@ -238,7 +280,11 @@ class VaultStore:
             blob = self._git("hash-object", "-w", "--stdin", data=content).decode().strip()
             self._git("update-index", "--add", "--cacheinfo", mode, blob, path, index=index)
             tree = self._git("write-tree", index=index).decode().strip()
-            message = f"{operation} {path}\n\nVaultWrite-Actor: {actor}\nVaultWrite-Request: {request_id}\n"
+            subject = f"{operation} {path}"
+            if self.settings.model.enabled:
+                diff = self._git("diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-color", head, "--", path, index=index).decode(errors="replace")
+                subject = self._subject(diff, subject)
+            message = f"{subject}\n\nVaultWrite-Actor: {actor}\nVaultWrite-Request: {request_id}\n"
             commit = self._git("commit-tree", tree, "-p", head, data=message.encode()).decode().strip()
             return blob, commit
         finally:
@@ -273,6 +319,8 @@ class VaultStore:
             previous = self._receipt(request_id, fingerprint)
             if previous is not None:
                 return previous
+            if self.settings.commit.mode == "immediate" and self._pending_entries():
+                raise VaultError("PENDING_BATCH", "Flush pending interval writes before switching to immediate mode.")
             old = self._read(target)
             if version(old) != expected_version:
                 raise VaultError("VERSION_CONFLICT", "Re-read the note, merge your change, and retry.", current_version=version(old))
@@ -288,23 +336,31 @@ class VaultStore:
             entry = self._git("ls-tree", "-z", head, "--", path)
             old_blob = None
             git_mode = "100644"
+            pending = self._pending_entry(path)
             if entry:
                 metadata = entry.split(b"\t", 1)[0].decode().split()
                 git_mode, kind, old_blob = metadata
                 if kind != "blob" or git_mode not in ("100644", "100755"):
                     raise VaultError("INVALID_PATH", "Only regular Git files are supported.")
                 committed = self._git("cat-file", "blob", old_blob)
-                if committed != old:
+                if committed != old and pending is None:
                     raise VaultError("DIRTY_TARGET", "The note differs from HEAD; commit external edits before writing.")
-            elif old is not None:
+            elif old is not None and pending is None:
                 raise VaultError("UNTRACKED_TARGET", "Commit this existing untracked note before writing.")
+            if pending and (pending["ref"] != ref or pending["old_blob"] != old_blob or pending["version"] != version(old)):
+                raise VaultError("DIRTY_TARGET", "The pending note or its Git baseline changed outside VaultWrite.")
             result = {"path": path, "version": version(new), "commit": head, "request_id": request_id, "changed": new != old, "replayed": False}
+            if self.settings.commit.mode == "interval":
+                result.update({"pending": pending is not None, "commit": None if pending else head})
             if new == old:
                 self._save_receipt(request_id, fingerprint, result)
                 return result
             attributes = self._git("check-attr", "-z", "filter", "working-tree-encoding", "--", path).split(b"\0")
             if attributes[2::3] != [b"unspecified", b"unspecified"]:
                 raise VaultError("UNSUPPORTED_ATTRIBUTES", "Git filters and working-tree-encoding are not supported for managed notes.")
+            if self.settings.commit.mode == "interval":
+                from .batch import defer_write
+                return defer_write(self, path, old, new, head, ref, old_blob, git_mode, request_id, fingerprint, result, actor)
             blob, commit = self._prepare_commit(path, new, head, git_mode, actor, request_id, operation)
             result["commit"] = commit
             file_mode = stat.S_IMODE(target.stat().st_mode) if target.exists() else 0o644

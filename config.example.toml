@@ -1,0 +1,20 @@
+# 不传 --config 时使用这些默认值；复制后通过 --config 指定自己的文件。
+[commit]
+mode = "immediate"              # immediate / interval
+interval_seconds = 300          # interval 提交及自动 push 的检查周期
+
+[model]
+enabled = false
+api_url = ""                   # 完整 Chat Completions URL，例如 https://host/v1/chat/completions
+model = ""                     # 使用你的提供商支持的模型名称
+api_key_env = "VAULT_WRITE_MODEL_API_KEY"
+timeout_seconds = 10
+max_diff_chars = 12000
+max_output_tokens = 256
+token_limit_field = "max_completion_tokens" # 旧兼容接口可改为 max_tokens
+failure_policy = "fallback"    # fallback 用默认信息；defer 保留待提交内容并报告失败
+
+[push]
+enabled = false
+remote = "origin"              # Vault 内已经配置的 Git remote
+branch = ""                    # 空值跟随当前分支；不会 force push

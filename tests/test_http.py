@@ -16,7 +16,7 @@ from vault_write_mcp.store import init_vault
 
 
 @pytest.fixture
-def endpoint(tmp_path):
+def endpoint(tmp_path, request):
     init_vault(tmp_path)
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -24,9 +24,14 @@ def endpoint(tmp_path):
     url = f"http://127.0.0.1:{port}/mcp"
     token = "integration-test-token"
     log = tmp_path / ".git" / "server-test.log"
+    command = [sys.executable, "-m", "vault_write_mcp.server", "serve", "--vault", str(tmp_path), "--port", str(port)]
+    if getattr(request, "param", None) == "interval":
+        config = tmp_path / ".git/server-test.toml"
+        config.write_text('[commit]\nmode="interval"\ninterval_seconds=1\n')
+        command.extend(["--config", str(config)])
     with log.open("w+") as output:
         process = subprocess.Popen(
-            [sys.executable, "-m", "vault_write_mcp.server", "serve", "--vault", str(tmp_path), "--port", str(port)],
+            command,
             env={**os.environ, "VAULT_WRITE_TOKEN": token}, stdout=output, stderr=output,
         )
         try:
@@ -126,3 +131,24 @@ def test_documented_client_example(endpoint):
     assert result.returncode == 0, result.stderr
     assert '"conflict_rejected": true' in result.stdout
     assert '"retry_deduplicated": true' in result.stdout
+
+
+@pytest.mark.parametrize("endpoint", ["interval"], indirect=True)
+async def test_configured_interval_worker_commits_pending_mcp_writes(endpoint):
+    async with client(endpoint) as session:
+        arguments = {"path": "note.md", "content": "# Pending\n", "expected_version": "missing", "request_id": "interval-create", "actor": "test"}
+        created = await session.call_tool("write_note", arguments)
+        assert not created.isError
+        assert created.structuredContent["pending"] and created.structuredContent["commit"] is None
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            replay = await session.call_tool("write_note", arguments)
+            assert not replay.isError and replay.structuredContent["replayed"]
+            if not replay.structuredContent["pending"]:
+                break
+            await asyncio.sleep(0.1)
+        else:
+            pytest.fail("The interval worker did not commit the pending note")
+        history = await session.call_tool("note_history", {"path": "note.md"})
+        assert len(history.structuredContent["commits"]) == 1
+        assert history.structuredContent["commits"][0]["subject"] == "docs: 更新 1 篇知识笔记"

@@ -7,7 +7,7 @@ name = "vault-write-mcp"
 version = "0.1.0"
 description = "Version-checked Markdown writes with coordinated Git history over MCP."
 requires-python = ">=3.11"
-dependencies = ["mcp>=1.30,<2", "uvicorn>=0.35,<1"]
+dependencies = ["mcp>=1.30,<2", "uvicorn>=0.35,<1", "httpx>=0.28,<1"]
 
 [project.optional-dependencies]
 test = ["pytest>=8,<10", "pytest-asyncio>=0.25,<2", "httpx>=0.28,<1"]

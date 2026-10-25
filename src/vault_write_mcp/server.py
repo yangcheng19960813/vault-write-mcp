@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from contextlib import asynccontextmanager
 import hmac
 import ipaddress
 import json
 import logging
 import os
+import sqlite3
 from typing import Callable
 
 from mcp.server.fastmcp import FastMCP
@@ -18,6 +20,8 @@ from starlette.responses import JSONResponse
 import uvicorn
 
 from .store import VaultError, VaultStore, init_vault
+from .config import load_settings
+from .worker import CommitWorker
 
 
 class BearerAuth:
@@ -61,7 +65,7 @@ def create_app(store: VaultStore, token: str, host: str = "127.0.0.1", port: int
             return CallToolResult(content=[TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))], structuredContent=payload)
         except VaultError as exc:
             payload = {"ok": False, "error": exc.as_dict()}
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, sqlite3.Error) as exc:
             logging.exception("Vault operation failed")
             payload = {"ok": False, "error": {"code": "STORAGE_ERROR", "message": str(exc)}}
         return CallToolResult(isError=True, content=[TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))], structuredContent=payload)
@@ -86,7 +90,22 @@ def create_app(store: VaultStore, token: str, host: str = "127.0.0.1", port: int
         """List up to 100 Git commits affecting a Markdown note, newest first."""
         return await invoke(store.note_history, path=path, limit=limit)
 
-    return BearerAuth(mcp.streamable_http_app(), token)
+    app = mcp.streamable_http_app()
+    if store.settings.commit.mode == "interval" or store.settings.push.enabled:
+        original_lifespan = app.router.lifespan_context
+
+        @asynccontextmanager
+        async def lifespan(application):
+            async with original_lifespan(application) as state:
+                worker = CommitWorker(store)
+                worker.start()
+                try:
+                    yield state
+                finally:
+                    await asyncio.to_thread(worker.stop)
+
+        app.router.lifespan_context = lifespan
+    return BearerAuth(app, token)
 
 
 def main() -> None:
@@ -98,10 +117,19 @@ def main() -> None:
     serve.add_argument("--vault", required=True)
     serve.add_argument("--host", default="127.0.0.1", help="Explicit bind IP; defaults to loopback.")
     serve.add_argument("--port", default=18182, type=int)
+    serve.add_argument("--config", help="Optional TOML configuration file.")
+    flush = subparsers.add_parser("flush", help="Commit pending interval writes and optionally push.")
+    flush.add_argument("--vault", required=True)
+    flush.add_argument("--config", help="Use the same TOML configuration as serve.")
     args = parser.parse_args()
     try:
         if args.command == "init":
             print(init_vault(args.vault))
+            return
+        settings = load_settings(args.config)
+        if args.command == "flush":
+            store = VaultStore(args.vault, settings)
+            print(json.dumps({"commit": store.flush(), "push": store.push()}, ensure_ascii=False))
             return
         token = os.environ.get("VAULT_WRITE_TOKEN", "")
         if not 1 <= args.port <= 65535:
@@ -109,7 +137,7 @@ def main() -> None:
         # Validate the token and bind address before opening or recovering a vault.
         _validate_token(token)
         ipaddress.ip_address(args.host)
-        app = create_app(VaultStore(args.vault), token, args.host, args.port)
+        app = create_app(VaultStore(args.vault, settings), token, args.host, args.port)
     except (VaultError, OSError, ValueError) as exc:
         parser.exit(2, f"{exc}\n")
     uvicorn.run(app, host=args.host, port=args.port, access_log=False, proxy_headers=False)
