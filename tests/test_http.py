@@ -22,24 +22,34 @@ def endpoint(tmp_path, request):
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     url = f"http://127.0.0.1:{port}/mcp"
-    token = "integration-test-token"
+    mode = getattr(request, "param", None)
+    token = None if mode in ("no-auth", "interval-no-auth") else "integration-test-token"
     log = tmp_path / ".git" / "server-test.log"
     command = [sys.executable, "-m", "vault_write_mcp.server", "serve", "--vault", str(tmp_path), "--port", str(port)]
-    if getattr(request, "param", None) == "interval":
+    if mode in ("interval", "no-auth", "interval-no-auth"):
         config = tmp_path / ".git/server-test.toml"
-        config.write_text('[commit]\nmode="interval"\ninterval_seconds=1\n')
+        text = '[auth]\nenabled=false\n' if token is None else ""
+        if mode in ("interval", "interval-no-auth"):
+            text += '[commit]\nmode="interval"\ninterval_seconds=1\n'
+        config.write_text(text)
         command.extend(["--config", str(config)])
+    env = dict(os.environ)
+    if token is None:
+        env.pop("VAULT_WRITE_TOKEN", None)
+    else:
+        env["VAULT_WRITE_TOKEN"] = token
     with log.open("w+") as output:
         process = subprocess.Popen(
             command,
-            env={**os.environ, "VAULT_WRITE_TOKEN": token}, stdout=output, stderr=output,
+            env=env, stdout=output, stderr=output,
         )
         try:
             for _ in range(100):
                 if process.poll() is not None:
                     pytest.fail(log.read_text())
                 try:
-                    if httpx.get(url, timeout=0.2, trust_env=False).status_code == 401:
+                    status = httpx.get(url, timeout=0.2, trust_env=False).status_code
+                    if status == 401 if token is not None else status in (405, 406):
                         break
                 except httpx.TransportError:
                     time.sleep(0.1)
@@ -58,17 +68,20 @@ def endpoint(tmp_path, request):
 @asynccontextmanager
 async def client(endpoint):
     url, token = endpoint
-    async with httpx.AsyncClient(headers={"Authorization": f"Bearer {token}"}, timeout=30, trust_env=False) as http, streamable_http_client(url, http_client=http) as (read, write, _):
+    headers = {"Authorization": f"Bearer {token}"} if token is not None else {}
+    async with httpx.AsyncClient(headers=headers, timeout=30, trust_env=False) as http, streamable_http_client(url, http_client=http) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
             yield session
 
 
+@pytest.mark.parametrize("endpoint", [None, "no-auth"], indirect=True)
 async def test_real_mcp_handshake_auth_schema_and_version_errors(endpoint):
-    url, _ = endpoint
-    async with httpx.AsyncClient(trust_env=False) as http:
-        assert (await http.post(url, json={})).status_code == 401
-        assert (await http.post(url, headers={"Authorization": "Bearer wrong"}, json={})).status_code == 401
+    url, token = endpoint
+    if token is not None:
+        async with httpx.AsyncClient(trust_env=False) as http:
+            assert (await http.post(url, json={})).status_code == 401
+            assert (await http.post(url, headers={"Authorization": "Bearer wrong"}, json={})).status_code == 401
     async with client(endpoint) as session:
         tools = {tool.name: tool for tool in (await session.list_tools()).tools}
         assert set(tools) == {"read_note", "write_note", "append_note", "note_history"}
@@ -94,6 +107,7 @@ async def test_real_mcp_handshake_auth_schema_and_version_errors(endpoint):
         assert len(history.structuredContent["commits"]) == 1
 
 
+@pytest.mark.parametrize("endpoint", [None, "no-auth"], indirect=True)
 async def test_two_independent_mcp_clients_conflict_merge_and_retry(endpoint):
     async with client(endpoint) as a, client(endpoint) as b:
         created = await a.call_tool("write_note", {"path": "note.md", "content": "# Test\n", "expected_version": "missing", "request_id": "create", "actor": "test"})
@@ -112,9 +126,12 @@ async def test_two_independent_mcp_clients_conflict_merge_and_retry(endpoint):
         assert final.structuredContent["content"].count("A\n") == final.structuredContent["content"].count("B\n") == 1
 
 
+@pytest.mark.parametrize("endpoint", [None, "no-auth"], indirect=True)
 async def test_http_host_and_browser_origin_restrictions(endpoint):
     url, token = endpoint
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json, text/event-stream"}
+    headers = {"Accept": "application/json, text/event-stream"}
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
     async with httpx.AsyncClient(trust_env=False) as http:
         response = await http.post(url, headers={**headers, "Host": "attacker.example"}, json={})
         assert response.status_code == 421
@@ -133,7 +150,7 @@ def test_documented_client_example(endpoint):
     assert '"retry_deduplicated": true' in result.stdout
 
 
-@pytest.mark.parametrize("endpoint", ["interval"], indirect=True)
+@pytest.mark.parametrize("endpoint", ["interval", "interval-no-auth"], indirect=True)
 async def test_configured_interval_worker_commits_pending_mcp_writes(endpoint):
     async with client(endpoint) as session:
         arguments = {"path": "note.md", "content": "# Pending\n", "expected_version": "missing", "request_id": "interval-create", "actor": "test"}
@@ -152,3 +169,18 @@ async def test_configured_interval_worker_commits_pending_mcp_writes(endpoint):
         history = await session.call_tool("note_history", {"path": "note.md"})
         assert len(history.structuredContent["commits"]) == 1
         assert history.structuredContent["commits"][0]["subject"] == "docs: 更新 1 篇知识笔记"
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "8.8.8.8", "192.168.1.1"])
+def test_no_auth_rejects_other_bind_addresses_before_opening_vault(tmp_path, host):
+    config = tmp_path / "server.toml"
+    config.write_text("[auth]\nenabled=false\n")
+    vault = tmp_path / "not-a-vault"
+    result = subprocess.run(
+        [sys.executable, "-m", "vault_write_mcp.server", "serve", "--vault", str(vault),
+         "--host", host, "--config", str(config)],
+        env={key: value for key, value in os.environ.items() if key != "VAULT_WRITE_TOKEN"},
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 2
+    assert "loopback or Tailscale IPv4" in result.stderr
+    assert not vault.exists()

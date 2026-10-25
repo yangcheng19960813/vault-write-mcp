@@ -46,9 +46,17 @@ def _validate_token(token: str) -> None:
         raise ValueError("VAULT_WRITE_TOKEN must be a nonempty printable ASCII token without spaces.")
 
 
-def create_app(store: VaultStore, token: str, host: str = "127.0.0.1", port: int = 18182):
-    _validate_token(token)
+def _validate_auth(enabled: bool, token: str, host: str):
+    if enabled:
+        _validate_token(token)
     address = ipaddress.ip_address(host)
+    if not enabled and not (address.is_loopback or address in ipaddress.ip_network("100.64.0.0/10")):
+        raise ValueError("auth.enabled=false requires a loopback or Tailscale IPv4 bind address.")
+    return address
+
+
+def create_app(store: VaultStore, token: str, host: str = "127.0.0.1", port: int = 18182):
+    address = _validate_auth(store.settings.auth.enabled, token, host)
     authority = f"[{address}]" if address.version == 6 else str(address)
     allowed_hosts = [f"{authority}:{port}"]
     if address.is_loopback:
@@ -105,7 +113,7 @@ def create_app(store: VaultStore, token: str, host: str = "127.0.0.1", port: int
                     await asyncio.to_thread(worker.stop)
 
         app.router.lifespan_context = lifespan
-    return BearerAuth(app, token)
+    return BearerAuth(app, token) if store.settings.auth.enabled else app
 
 
 def main() -> None:
@@ -113,7 +121,7 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="command", required=True)
     initialize = subparsers.add_parser("init", help="Initialize a new, empty test vault.")
     initialize.add_argument("--vault", required=True)
-    serve = subparsers.add_parser("serve", help="Serve an existing Git vault over authenticated Streamable HTTP.")
+    serve = subparsers.add_parser("serve", help="Serve an existing Git vault over Streamable HTTP.")
     serve.add_argument("--vault", required=True)
     serve.add_argument("--host", default="127.0.0.1", help="Explicit bind IP; defaults to loopback.")
     serve.add_argument("--port", default=18182, type=int)
@@ -134,9 +142,8 @@ def main() -> None:
         token = os.environ.get("VAULT_WRITE_TOKEN", "")
         if not 1 <= args.port <= 65535:
             raise ValueError("port must be between 1 and 65535.")
-        # Validate the token and bind address before opening or recovering a vault.
-        _validate_token(token)
-        ipaddress.ip_address(args.host)
+        # Validate authentication and the bind address before opening or recovering a vault.
+        _validate_auth(settings.auth.enabled, token, args.host)
         app = create_app(VaultStore(args.vault, settings), token, args.host, args.port)
     except (VaultError, OSError, ValueError) as exc:
         parser.exit(2, f"{exc}\n")

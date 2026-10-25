@@ -77,10 +77,20 @@ class PushConfig:
 
 
 @dataclass(frozen=True)
+class AuthConfig:
+    enabled: bool = True
+
+    def __post_init__(self):
+        if type(self.enabled) is not bool:
+            raise ValueError("auth.enabled must be a boolean.")
+
+
+@dataclass(frozen=True)
 class Settings:
     commit: CommitConfig = field(default_factory=CommitConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     push: PushConfig = field(default_factory=PushConfig)
+    auth: AuthConfig = field(default_factory=AuthConfig)
 
 
 def load_settings(path: str | Path | None = None) -> Settings:
@@ -88,7 +98,7 @@ def load_settings(path: str | Path | None = None) -> Settings:
         return Settings()
     with Path(path).open("rb") as stream:
         data = tomllib.load(stream)
-    classes = {"commit": CommitConfig, "model": ModelConfig, "push": PushConfig}
+    classes = {"commit": CommitConfig, "model": ModelConfig, "push": PushConfig, "auth": AuthConfig}
     if set(data) - classes.keys():
         raise ValueError("Unknown configuration section.")
     sections = {}

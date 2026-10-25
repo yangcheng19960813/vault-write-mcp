@@ -15,7 +15,7 @@ export VAULT_WRITE_TOKEN="$(openssl rand -hex 32)"
 uv run vault-write-mcp serve --vault /tmp/vault-write-demo
 ```
 
-默认端点是 `http://127.0.0.1:18182/mcp`。客户端必须携带 `Authorization: Bearer <VAULT_WRITE_TOKEN>`。服务启动时就会检查和恢复未完成事务。
+默认端点是 `http://127.0.0.1:18182/mcp`。默认启用认证，客户端携带 `Authorization: Bearer <VAULT_WRITE_TOKEN>`；可信私网可按下节配置关闭认证。服务启动时就会检查和恢复未完成事务。
 
 在另一个终端设置相同的 `VAULT_WRITE_TOKEN`，运行官方 SDK 客户端示例：
 
@@ -33,6 +33,19 @@ uv run vault-write-mcp serve --vault /path/to/test-vault --host 100.x.y.z --port
 
 用真实 IP 替换示例。客户端随后连接 `http://<该 IP>:18182/mcp`。Host 校验使用这个明确的地址；反向代理、浏览器跨域和公网 TLS 部署尚未配置。先使用隔离库测试。
 
+## 私网无令牌连接
+
+在 TOML 中设置：
+
+```toml
+[auth]
+enabled = false
+```
+
+然后用 `serve --config /path/to/vault-write.toml --host <实际的 Tailscale IPv4>` 启动。客户端只配置 MCP URL，无需 Authorization 请求头；服务不再要求 `VAULT_WRITE_TOKEN`。这种模式仅允许回环地址或 `100.64.0.0/10` 地址监听；可访问该私网端点的设备均可调用读写工具。版本前置条件、文件锁、请求去重和 Git 行为保持不变。
+
+`auth.enabled` 默认为 `true`，原有令牌部署无需修改。模型 API Key 与 MCP 访问认证独立，关闭访问认证不会启用模型调用。
+
 ## 可配置的提交与模型调用
 
 不传 `--config` 时保持默认行为：每次有效写入立即提交 Git，模型调用和自动 push 均关闭。完整字段与默认值见 [`config.example.toml`](config.example.toml)。配置文件使用 Python 标准库读取，不引入 Agent SDK；HTTP 请求复用已有的 httpx。
@@ -43,6 +56,7 @@ uv run vault-write-mcp serve --vault /path/to/test-vault --config /path/to/vault
 
 | 配置 | 默认值 | 含义 |
 | --- | --- | --- |
+| `auth.enabled` | `true` | MCP bearer 认证；可信私网可设为 `false`，客户端仅需 URL |
 | `commit.mode` | `immediate` | `immediate` 逐次提交；`interval` 定时汇总提交 |
 | `commit.interval_seconds` | `300` | 批次提交与自动 push 的检查间隔，1–86400 秒 |
 | `model.enabled` | `false` | 开启模型生成 commit 信息 |
@@ -95,7 +109,7 @@ uv run vault-write-mcp flush --vault /path/to/test-vault --config /path/to/vault
 
 逐次模式成功写入返回 `version`、`commit`、`changed`、`request_id` 和 `replayed`。正文没有变化时 `changed: false`，不会额外创建空提交。该模式的提交只包含该笔记，正文记录 `VaultWrite-Actor` 和 `VaultWrite-Request`；定时模式的批次提交记录涉及的 actor 和请求编号。
 
-`actor` 是调用方提供的审计标签，不是经过独立认证的用户身份。首版使用共享 bearer token。
+`actor` 是调用方提供的审计标签，不是经过独立认证的用户身份。默认使用共享 bearer token；私网可按上述配置关闭认证。
 
 ## 冲突与重试
 

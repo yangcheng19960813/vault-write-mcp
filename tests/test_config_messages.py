@@ -34,6 +34,7 @@ def test_example_configuration_preserves_defaults():
     "[model]\nmax_diff_chars=1", "[model]\nmax_output_tokens=128.5", "[model]\nfailure_policy='ignore'",
     "[model]\napi_key_env='bad-name'", "[model]\ntoken_limit_field='unknown'", "[push]\nremote='--all'",
     "[model]\nenabled=true\napi_url='file:///tmp/model'\nmodel='test'",
+    "[auth]\nenabled='false'", "[auth]\nenabled=1",
 ])
 def test_invalid_configuration_is_rejected(tmp_path, content):
     path = tmp_path / "config.toml"

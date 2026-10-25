@@ -1,4 +1,7 @@
 # 不传 --config 时使用这些默认值；复制后通过 --config 指定自己的文件。
+[auth]
+enabled = true                 # 私网无令牌连接可设为 false；仅允许回环或 Tailscale IPv4 监听
+
 [commit]
 mode = "immediate"              # immediate / interval
 interval_seconds = 300          # interval 提交及自动 push 的检查周期
