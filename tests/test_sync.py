@@ -462,3 +462,24 @@ def test_recovery_ignores_nonportable_execution_bits_with_core_filemode_false(pa
     assert recovered.read_note("b.md")["content"] == "b"
     assert not recovered.journal.exists()
     assert write(recovered, "after.md", "after", "after")["changed"]
+
+
+def test_private_unknown_temp_does_not_block_sync_or_change_saved_patch_context(pair):
+    remote, main, writer = pair
+    unknown = writer.state / "atomic-unregistered.tmp"
+    unknown.write_bytes(b"ownership cannot be proved")
+    snapshot = writer.read_note_range("note.md")
+    arguments = {
+        "path": "note.md", "edits": [{"op": "SWAP", "anchor": snapshot["lines"][0].split("|", 1)[0], "lines": ["original result"]}],
+        "expected_version": snapshot["version"], "request_id": "context", "actor": "test", "return_context": True,
+    }
+    first = writer.patch_note(**arguments)
+    write(main, "human.md", "human\n", "human")
+    publish(main)
+    assert writer.sync()["state"] == "synced"
+    write(writer, "note.md", "future content\n", "future")
+    assert writer.sync()["state"] == "synced"
+    replay = VaultStore(writer.root, SYNC).patch_note(**arguments)
+    assert replay["replayed"] and replay["result_context"] == first["result_context"] and replay["version"] == first["version"]
+    assert unknown.read_bytes() == b"ownership cannot be proved"
+    assert "atomic-" not in git(remote, "ls-tree", "-r", "--name-only", "main")

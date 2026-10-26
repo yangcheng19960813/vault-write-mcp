@@ -356,12 +356,13 @@ class VaultStore:
             data = self._read(self._path(path))
             return {"path": path, "exists": data is not None, "version": version(data), **read_range(data, start_line, max_lines)}
 
-    def find_note(self, path: str, text: str, start_line: int = 1, max_matches: int = 10) -> dict:
+    def find_note(self, path: str, text: str, start_line: int = 1, max_matches: int = 10,
+                  context_before: int = 0, context_after: int = 0) -> dict:
         from .editing import find_lines
         with self._locked():
             self._recover()
             data = self._read(self._path(path))
-            return {"path": path, "exists": data is not None, "version": version(data), **find_lines(data, text, start_line, max_matches)}
+            return {"path": path, "exists": data is not None, "version": version(data), **find_lines(data, text, start_line, max_matches, context_before, context_after)}
 
     def _prepare_commit(self, path: str, content: bytes, head: str, mode: str, actor: str, request_id: str, operation: str) -> tuple[str, str]:
         fd, temporary = tempfile.mkstemp(prefix="index-", dir=self.state)
@@ -390,11 +391,19 @@ class VaultStore:
     def append_note(self, path: str, content: str, expected_version: str, request_id: str, actor: str) -> dict:
         return self._mutate("append", path, content, expected_version, request_id, actor)
 
-    def patch_note(self, path: str, edits: list[dict], expected_version: str, request_id: str, actor: str) -> dict:
-        from .editing import validate_edits
-        return self._mutate("patch", path, validate_edits(edits), expected_version, request_id, actor)
+    def patch_note(self, path: str, edits: list[dict], expected_version: str, request_id: str, actor: str,
+                   return_context: bool = False, context_before: int = 0, context_after: int = 0) -> dict:
+        from .editing import validate_context, validate_edits
+        if type(return_context) is not bool:
+            raise VaultError("INVALID_CONTEXT", "return_context must be a boolean.")
+        validate_context(context_before, context_after)
+        if not return_context and (context_before or context_after):
+            raise VaultError("INVALID_CONTEXT", "Set return_context=true when requesting patch context.")
+        options = {"return_context": True, "context_before": context_before, "context_after": context_after} if return_context else None
+        return self._mutate("patch", path, validate_edits(edits), expected_version, request_id, actor, options)
 
-    def _mutate(self, operation: str, path: str, content: str | list[dict], expected_version: str, request_id: str, actor: str) -> dict:
+    def _mutate(self, operation: str, path: str, content: str | list[dict], expected_version: str, request_id: str, actor: str,
+                result_options: dict | None = None) -> dict:
         if not isinstance(expected_version, str) or not re.fullmatch(r"missing|sha256:[0-9a-f]{64}", expected_version):
             raise VaultError("INVALID_VERSION", "expected_version must be 'missing' or a read_note SHA-256 version; bypasses are not supported.")
         if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", request_id):
@@ -409,7 +418,13 @@ class VaultStore:
             raise VaultError("INVALID_ENCODING", "content must be valid UTF-8.") from exc
         if len(encoded) > self.MAX_BYTES:
             raise VaultError("TOO_LARGE", "Notes must be at most 1 MiB.")
-        fingerprint = hashlib.sha256(json.dumps([operation, path, content, expected_version, actor], ensure_ascii=True).encode()).hexdigest()
+        arguments = [operation, path, content, expected_version, actor]
+        # Keep the original default fingerprint, so receipts written by older
+        # servers remain replayable. Nondefault result options are semantic
+        # request arguments, not a view of whatever file exists on a retry.
+        if result_options is not None:
+            arguments.append(result_options)
+        fingerprint = hashlib.sha256(json.dumps(arguments, ensure_ascii=True).encode()).hexdigest()
         with self._locked():
             self._recover()
             if self.settings.sync.enabled:
@@ -428,8 +443,8 @@ class VaultStore:
             if operation in ("append", "patch") and old is None:
                 raise VaultError("NOT_FOUND", "Create the note with write_note before appending or patching.")
             if operation == "patch":
-                from .editing import apply_patch
-                new = apply_patch(old, content)
+                from .editing import apply_patch_with_spans
+                new, spans = apply_patch_with_spans(old, content)
             else:
                 new = (old or b"") + encoded if operation == "append" else encoded
             if len(new) > self.MAX_BYTES:
@@ -455,6 +470,9 @@ class VaultStore:
             if pending and (pending["ref"] != ref or pending["old_blob"] != old_blob or pending["version"] != version(old)):
                 raise VaultError("DIRTY_TARGET", "The pending note or its Git baseline changed outside VaultWrite.")
             result = {"path": path, "version": version(new), "commit": head, "request_id": request_id, "changed": new != old, "replayed": False}
+            if result_options is not None:
+                from .editing import patch_context
+                result["result_context"] = patch_context(new, spans, result_options["context_before"], result_options["context_after"])
             if self.settings.commit.mode == "interval":
                 result.update({"pending": pending is not None, "commit": None if pending else head})
             if new == old:

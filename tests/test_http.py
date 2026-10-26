@@ -231,3 +231,44 @@ async def test_sync_worker_and_status_over_real_mcp(endpoint):
         else:
             pytest.fail("Sync worker did not publish the note: " + str(state))
         assert state["published"] and state["applied"] and state["state"] == "synced"
+
+
+@pytest.mark.parametrize("endpoint", [None, "no-auth", "interval", "sync"], indirect=True)
+async def test_context_schema_new_anchors_and_snapshot_replay_over_real_mcp(endpoint):
+    async with client(endpoint) as session:
+        tools = {tool.name: tool for tool in (await session.list_tools()).tools}
+        for name in ("find_note", "patch_note"):
+            properties = tools[name].inputSchema["properties"]
+            assert properties["context_before"]["default"] == 0
+            assert properties["context_before"]["minimum"] == 0 and properties["context_before"]["maximum"] == 50
+        assert tools["patch_note"].inputSchema["properties"]["return_context"]["default"] is False
+        created = (await session.call_tool("write_note", {
+            "path": "note.md", "content": "one\nTARGET\nthree\nfour\n", "expected_version": "missing", "request_id": "seed", "actor": "test",
+        })).structuredContent
+        found = (await session.call_tool("find_note", {
+            "path": "note.md", "text": "TARGET", "context_before": 1, "context_after": 1,
+        })).structuredContent
+        assert found["version"] == created["version"] and not found["context_truncated"]
+        assert len(found["windows"]) == 1 and len(found["windows"][0]["lines"]) == 3
+        arguments = {
+            "path": "note.md", "edits": [{"op": "SWAP", "anchor": found["matches"][0].split("|", 1)[0], "lines": ["NEW", "inserted"]}],
+            "expected_version": found["version"], "request_id": "context-patch", "actor": "test", "return_context": True, "context_after": 1,
+        }
+        first = (await session.call_tool("patch_note", arguments)).structuredContent
+        assert first["ok"] and not first["result_context"]["truncated"]
+        fresh = first["result_context"]["windows"][0]["lines"][-1]
+        assert fresh.startswith("4:") and fresh.endswith("|three")
+        second = await session.call_tool("patch_note", {
+            "path": "note.md", "edits": [{"op": "SWAP", "anchor": fresh.split("|", 1)[0], "lines": ["FUTURE"]}],
+            "expected_version": first["version"], "request_id": "future", "actor": "test",
+        })
+        assert not second.isError
+        replay = (await session.call_tool("patch_note", arguments)).structuredContent
+        assert replay["replayed"] and replay["result_context"] == first["result_context"] and replay["version"] == first["version"]
+        mismatch = await session.call_tool("patch_note", {**arguments, "context_after": 2})
+        assert mismatch.isError and mismatch.structuredContent["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+        for bad in (True, -1, 51, "1"):
+            invalid = await session.call_tool("find_note", {"path": "note.md", "text": "NEW", "context_before": bad})
+            assert invalid.isError
+        invalid = await session.call_tool("patch_note", {**arguments, "return_context": "true"})
+        assert invalid.isError

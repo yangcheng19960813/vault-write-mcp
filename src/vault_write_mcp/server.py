@@ -11,7 +11,9 @@ import json
 import logging
 import os
 import sqlite3
-from typing import Callable
+from typing import Annotated, Callable
+
+from pydantic import Field
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -22,7 +24,11 @@ import uvicorn
 from .store import VaultError, VaultStore, init_vault
 from .config import load_settings
 from .worker import CommitWorker
-from .editing import LineEdit
+from .editing import LineEdit, MAX_CONTEXT_DISTANCE
+
+
+ContextDistance = Annotated[int, Field(strict=True, ge=0, le=MAX_CONTEXT_DISTANCE)]
+ReturnContext = Annotated[bool, Field(strict=True)]
 
 
 class BearerAuth:
@@ -90,9 +96,11 @@ def create_app(store: VaultStore, token: str, host: str = "127.0.0.1", port: int
         return await invoke(store.read_note_range, path=path, start_line=start_line, max_lines=max_lines)
 
     @mcp.tool()
-    async def find_note(path: str, text: str, start_line: int = 1, max_matches: int = 10) -> CallToolResult:
-        """Find literal, case-sensitive text in one note; return matching line:hash|text and the whole-note version. No regex or model calls. Continue at next_line or read context with read_note_range."""
-        return await invoke(store.find_note, path=path, text=text, start_line=start_line, max_matches=max_matches)
+    async def find_note(path: str, text: str, start_line: int = 1, max_matches: int = 10,
+                        context_before: ContextDistance = 0, context_after: ContextDistance = 0) -> CallToolResult:
+        """Find literal, case-sensitive text in one note; return matching line:hash|text and the whole-note version. Optional before/after (0–50) add merged context windows, bounded to 200 window lines and 16 KiB of rendered lines including matches. context_truncated marks omitted context. Continue matching at next_line; context does not advance it. No regex/model calls."""
+        return await invoke(store.find_note, path=path, text=text, start_line=start_line, max_matches=max_matches,
+                            context_before=context_before, context_after=context_after)
 
     @mcp.tool()
     async def write_note(path: str, content: str, expected_version: str, request_id: str, actor: str) -> CallToolResult:
@@ -105,9 +113,12 @@ def create_app(store: VaultStore, token: str, host: str = "127.0.0.1", port: int
         return await invoke(store.append_note, path=path, content=content, expected_version=expected_version, request_id=request_id, actor=actor)
 
     @mcp.tool()
-    async def patch_note(path: str, edits: list[LineEdit], expected_version: str, request_id: str, actor: str) -> CallToolResult:
-        """Apply 1–100 edits atomically against the exact version. SWAP/DEL accept an optional inclusive end_anchor; INS.PRE/INS.POST insert around one anchor. lines contains newline-free strings (DEL omits it). All anchors refer to the original snapshot; overlapping ranges/anchors are rejected. Preserve BOM and untouched bytes; SWAP and tail insertion retain EOF newline. Re-read on conflicts; retry transport failures with identical arguments."""
-        return await invoke(store.patch_note, path=path, edits=[edit.model_dump(exclude_none=True) for edit in edits], expected_version=expected_version, request_id=request_id, actor=actor)
+    async def patch_note(path: str, edits: list[LineEdit], expected_version: str, request_id: str, actor: str,
+                         return_context: ReturnContext = False, context_before: ContextDistance = 0,
+                         context_after: ContextDistance = 0) -> CallToolResult:
+        """Apply 1–100 edits atomically against the exact version. SWAP/DEL accept an optional inclusive end_anchor; INS.PRE/INS.POST insert around one anchor. lines contains newline-free strings (DEL omits it). All anchors refer to the original snapshot; overlapping ranges/anchors are rejected. Preserve BOM and untouched bytes; SWAP and tail insertion retain EOF newline. return_context=true adds bounded result_context windows with fresh post-edit anchors; optional before/after are 0–50. At most 200 context lines/16 KiB, with truncated=true when omitted. Retries replay this original snapshot, not future content. Re-read on conflicts; retry transport failures with identical arguments, including result options."""
+        return await invoke(store.patch_note, path=path, edits=[edit.model_dump(exclude_none=True) for edit in edits], expected_version=expected_version, request_id=request_id, actor=actor,
+                            return_context=return_context, context_before=context_before, context_after=context_after)
 
     @mcp.tool()
     async def note_history(path: str, limit: int = 20) -> CallToolResult:
