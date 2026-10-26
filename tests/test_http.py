@@ -89,7 +89,7 @@ async def test_real_mcp_handshake_auth_schema_and_version_errors(endpoint):
             assert (await http.post(url, headers={"Authorization": "Bearer wrong"}, json={})).status_code == 401
     async with client(endpoint) as session:
         tools = {tool.name: tool for tool in (await session.list_tools()).tools}
-        assert set(tools) == {"read_note", "read_note_range", "find_note", "write_note", "append_note", "patch_note", "note_history", "sync_status"}
+        assert set(tools) == {"read_note", "read_note_range", "find_note", "write_note", "append_note", "patch_note", "preview_move_note", "move_note", "note_history", "sync_status"}
         for name in ("write_note", "append_note", "patch_note"):
             assert {"expected_version", "request_id", "actor"} <= set(tools[name].inputSchema["required"])
         status = await session.call_tool("sync_status", {})
@@ -272,3 +272,36 @@ async def test_context_schema_new_anchors_and_snapshot_replay_over_real_mcp(endp
             assert invalid.isError
         invalid = await session.call_tool("patch_note", {**arguments, "return_context": "true"})
         assert invalid.isError
+
+
+@pytest.mark.parametrize("endpoint", [None, "no-auth", "interval", "sync"], indirect=True)
+async def test_preview_move_and_reference_updates_over_real_mcp(endpoint):
+    async with client(endpoint) as session:
+        tools = {tool.name: tool for tool in (await session.list_tools()).tools}
+        assert set(tools["move_note"].inputSchema["required"]) == {"source", "destination", "expected_versions", "plan_version", "request_id", "actor"}
+        for path, content, request in (("old.md", "source\n", "source"), ("ref.md", "[[old#h|Alias]]\n", "ref")):
+            result = await session.call_tool("write_note", {"path": path, "content": content, "expected_version": "missing", "request_id": request, "actor": "test"})
+            assert not result.isError
+        deadline = time.monotonic() + 8
+        while True:
+            preview = await session.call_tool("preview_move_note", {"source": "old.md", "destination": "archive/new.md"})
+            if not preview.isError:
+                break
+            assert preview.structuredContent["error"]["code"] == "PENDING_BATCH"
+            assert time.monotonic() < deadline
+            await asyncio.sleep(0.05)
+        plan = preview.structuredContent
+        assert plan["rewritten_links"] == 1
+        arguments = {key: plan[key] for key in ("source", "destination", "expected_versions", "plan_version")}
+        arguments.update({"request_id": "move", "actor": "test"})
+        moved = await session.call_tool("move_note", arguments)
+        assert not moved.isError
+        receipt = moved.structuredContent
+        assert receipt["versions"]["old.md"] == "missing"
+        assert (await session.call_tool("read_note", {"path": "ref.md"})).structuredContent["content"] == "[[./archive/new.md#h|Alias]]\n"
+        later = await session.call_tool("write_note", {"path": "archive/new.md", "content": "future\n", "expected_version": receipt["versions"]["archive/new.md"], "request_id": "future", "actor": "test"})
+        assert not later.isError
+        replay = (await session.call_tool("move_note", arguments)).structuredContent
+        assert replay == {**receipt, "replayed": True}
+        conflict = await session.call_tool("move_note", {**arguments, "actor": "different"})
+        assert conflict.isError and conflict.structuredContent["error"]["code"] == "IDEMPOTENCY_CONFLICT"

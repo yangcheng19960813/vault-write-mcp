@@ -134,6 +134,8 @@ uv run vault-write-mcp sync-status --vault /tmp/vault-write-ubuntu --config /pat
 | `write_note` | `path`, `content`, `expected_version`, `request_id`, `actor` | 创建或整篇替换；版本必须匹配 |
 | `append_note` | 同上 | 在版本检查和同一把锁内读取、拼接、写回；原样追加，不自动补换行 |
 | `patch_note` | `path`, `edits`, `expected_version`, `request_id`, `actor`, `return_context=false`, `context_before=0`, `context_after=0` | 根据行锚点原子替换、删除、插入；可选返回带新锚点的编辑后局部上下文 |
+| `preview_move_note` | `source`, `destination` | 只读预览移动方案、受影响路径、有限的逐链接目标摘要与版本前置条件 |
+| `move_note` | `source`, `destination`, `expected_versions`, `plan_version`, `request_id`, `actor` | 校验预览后以一个可恢复的多文件事务移动笔记并更新支持的引用；完成后创建一个 Git 提交 |
 | `note_history` | `path`, `limit=20` | 返回修改该笔记的 Git 提交，最多 100 条 |
 | `sync_status` | 无 | 只读同步状态、当前写入提交与待提交数，不触发同步 |
 
@@ -211,6 +213,67 @@ uv run python examples/editing_benchmark.py
 
 脚本对相同的两个连续编辑任务比较默认 `find_note`→`read_note_range`→`patch_note` 流程与上下文查找、编辑后锚点复用流程，并验证两者得到相同正文。它统计直接调用 Store 方法的次数及结果字典的紧凑 UTF-8 JSON 字节数，不含建库、验证、MCP/HTTP 封装、模型 token 或费用估算；所有数据只写入自动清理的临时库。
 
+### 安全移动笔记并更新引用
+
+移动不是无条件的 Git rename。先调用只读 `preview_move_note(source, destination)`，检查返回计划，再把同一次预览的 `plan_version` 和完整 `expected_versions` 原样交给 `move_note`。预览返回 `affected_paths`、实际改变的链接目标总数 `rewritten_links`、扫描的 Markdown 笔记数 `scan_count`、移动后的 `versions_after`，以及有限的 `link_changes` 摘要。每条摘要包含原路径 `path`、移动后的笔记路径 `result_path`、旧行号 `line` 和实际替换跨度的 `old_target`/`new_target`，不返回整篇正文。Wiki 摘要只包含路径跨度，`#fragment` 和别名留在跨度之外；Markdown 摘要按实际目的地跨度记录，可能含保留的片段。摘要最多 50 项及 16 KiB；`link_changes_truncated` 标明摘要是否截断，但 `rewritten_links` 始终是精确总数。版本映射包含源笔记、必须仍不存在的目标路径和确实需要改写的引用文件；移动后源路径版本为 `missing`，目标及被改写笔记返回新版本。
+
+预览摘要示意（真实响应还含计划版本、版本映射和路径列表）：
+
+```json
+{
+  "rewritten_links": 1,
+  "link_changes": [{
+    "path": "home/index.md",
+    "result_path": "home/index.md",
+    "line": 18,
+    "old_target": "../guide/old.md#install",
+    "new_target": "../archive/guide.md#install"
+  }],
+  "link_changes_truncated": false
+}
+```
+
+预览只读取当前 Vault 的本地已提交目录树，不会 fetch 远端分支或联网。使用双分支同步时，先按既有流程同步到所需快照，再预览和移动；预览之后才从远端合入的新引用不属于该计划，需同步后重新检查。系统不保证覆盖尚未同步到本地快照的远端 backlink。
+
+示例调用：
+
+```json
+{"source":"guide/v1/old-title.md","destination":"archive/reference/new-title.md"}
+```
+
+从结果复制 `plan_version` 和完整 `expected_versions`：
+
+```json
+{
+  "source":"guide/v1/old-title.md",
+  "destination":"archive/reference/new-title.md",
+  "expected_versions":{
+    "guide/v1/old-title.md":"sha256:<预览中的源版本>",
+    "archive/reference/new-title.md":"missing",
+    "home/index.md":"sha256:<预览中的引用笔记版本>"
+  },
+  "plan_version":"sha256:<预览中的计划版本>",
+  "request_id":"<本次移动的唯一编号>",
+  "actor":"codex"
+}
+```
+
+以上字段值只是示例；实际调用必须复制预览中的整个 `expected_versions` 对象，不能省略受影响的文件，也不能用示例哈希。应用时服务会重新计算计划并核对整篇版本：内容版本变化返回 `VERSION_CONFLICT`，Vault 拓扑或计划快照变化返回 `PLAN_CONFLICT`，应重新预览。源/目标须为可见的相对 POSIX `.md` 路径；名称不能包含用于解析引用的 `# | ^ : % ? [ ] ( ) < >` 或反引号。目标必须不存在，源必须是已提交笔记；Git 工作区与暂存区须干净，且不得有未跟踪或被忽略的可见 `.md` 文件，也不能有待提交的 interval 批次。若有待提交批次，先通过 `flush` 完成，移动不会隐式 flush。
+
+当前支持保守的本地引用子集：wiki 链接 `[[path]]`、带片段/别名的 `[[path#heading|label]]` 及嵌入 `![[path]]`；Markdown 行内链接和图片，如 `[label](relative/path.md#heading)`、`![alt](relative/image.png#fragment)`。Wiki 名称可按精确路径、引用笔记相对路径、以 `/` 开头的 Vault 根相对路径或唯一 basename/suffix 解析；这些路径形式均可尝试补 `.md` 后缀。Markdown 路径相对其所在笔记；所有相对写法（包括 `./`、`../` 和含点的 basename）在未解析时也会尝试 `.md`。若 `.md` 笔记与无扩展名附件同时匹配，预览以 `AMBIGUOUS_LINK` 拒绝，不猜测。Markdown 目的地可使用 UTF-8 百分号编码；包含 HTML entity 的本地目标不支持。移动后会更新指向源笔记的引用，并重定位源笔记内部的相对链接，以尽量保持其原目标；片段、别名、链接标签和图片标签保留。
+
+外部 scheme 链接（如 `https:`）、协议相对 URL（`//...`）、纯 `#anchor` 及正常的围栏代码、缩进代码和行内代码不改写。引用式 Markdown（`[label][id]` / `[id]: ...`）、本地 HTML `href`/`src`、front matter 本地文件引用（包括引号或列表形式）、嵌套/跨行/不支持的链接形式（包括 wiki 查询/转义语法）、含 HTML entity 的目标、畸形 URL 编码和逃出 Vault 根目录的路径不做猜测。行内/围栏代码按常规范围识别；反引号转义不会把后续活动链接隐藏成代码。存在 blockquote 起始、list-fence、含链接的 list/段落续行、raw HTML/code block 边界、Obsidian `%%` 注释或 math 容器时，预览保守返回 `UNSUPPORTED_LINK`，不对结构含糊的区域做替换。只支持 LF/CRLF 的 UTF-8 笔记（含可选 BOM）；仅使用 CR 的文件也拒绝处理。若扫描到无法安全处理的潜在引用，预览返回 `UNSUPPORTED_LINK`。同名候选不唯一、含糊的裸 wiki 目标，或新目标会截获原本不相关的链接时，返回 `AMBIGUOUS_LINK`。预览失败不会应用部分改写。
+
+扫描有硬上限：最多 2,000 个 Git 跟踪路径、1,000 篇可见 Markdown 笔记、16 MiB Markdown 正文和 100 个受影响路径；每篇最多 2,000 个可解析引用、全库最多 20,000 个，超限返回 `MOVE_TOO_LARGE`。摘要最多 50 项、16 KiB；超过摘要上限不丢失总数，但设置 `link_changes_truncated`。超过 4,096 字符的复杂括号结构也拒绝处理。预览只读。成功移动在一个可恢复事务中写入目标和引用文件，最后移除源，并创建一个包含这些变化的 Git 提交；服务重启/后续操作会恢复未完成事务，然后保存请求回执。相同 request id 与相同参数重试会重放原结果，不重复移动；修改参数需使用新 id。该保证适用于通过服务访问和恢复，普通文件系统读者仍可能在多文件应用期间观察到部分替换。
+
+可运行一个只使用自动清理临时 Vault 的完整示例：
+
+```sh
+uv run python examples/move_reference_demo.py
+```
+
+它演示 wiki 和 Markdown 入链更新、移动笔记中的出链相对路径重定位，以及相同请求的幂等重放；不会读取或修改现有 Vault。
+
 ## 冲突与重试
 
 ```text
@@ -261,7 +324,7 @@ git -C /tmp/vault-write-demo show <commit>:notes/example.md
 - 已有暂存修改会拒写；目标笔记有服务之外的未提交改动或尚未跟踪时也会拒写，保留外部编辑。定时模式只接纳本服务已登记的待提交内容。其他文件未暂存的修改和未跟踪文件会保留，不纳入服务提交。
 - 不支持 Git 内容过滤器或工作区编码转换、linked worktree、bare 仓库、Windows、NFS 或多机器直接共享文件锁。
 - **并发保证只覆盖统一通过本服务的写入。** Shell、编辑器、Obsidian、其他 MCP、Git pull/reset 和同步程序直接改同一副本会绕过锁。正式接管前需统一写入口并协调现有同步任务。
-- 自动 push 和双分支同步可按上述配置启用；没有正式库迁移、跨请求的批量原子写接口、删除/重命名写入 API 和服务常驻配置。QMD 继续负责检索。
+- 自动 push 和双分支同步可按上述配置启用；没有正式库迁移、跨请求的批量原子写接口、单独的删除写入 API 和服务常驻配置。移动/重命名仅通过上述预览后、校验版本并安全更新引用的流程完成。
 
 ## 验证
 
