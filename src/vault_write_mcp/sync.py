@@ -110,6 +110,8 @@ def _checkout_entries(store, old_head, new_head, check_worktree=True):
         if before == after:
             continue
         path = _path(store, name) if check_worktree else None
+        if after is not None:
+            store._check_atomic_device((store.root / name).parent)
         for item in (before, after):
             if item and (item[0] not in ("100644", "100755") or item[1] != "blob"):
                 raise VaultError("UNSUPPORTED_TREE", "Only regular Git files can be applied.")
@@ -149,6 +151,8 @@ def _verify_checkout(store, txn):
                 raise conflict()
     for entry in txn["entries"]:
         path = _path(store, entry["path"])
+        if entry["new"] is not None:
+            store._check_atomic_device(path.parent)
         current = _bytes(path)
         options = [None if entry[key] is None else base64.b64decode(entry[key]) for key in ("old", "new")]
         if current not in options:
