@@ -45,6 +45,14 @@ def status(store):
 
 
 def _save(store, result):
+    with store._locked():
+        return _save_locked(store, result)
+
+
+def _save_locked(store, result):
+    # Recovery reaps registered atomic temps under write.lock. Keep that lock
+    # until replacement finishes so a reader cannot reap this live status write.
+    # Callers already holding the non-reentrant lock must use this helper.
     result = {**result, "target": result.get("target", _target(store)), "completed_at": datetime.now(timezone.utc).isoformat()}
     store._atomic_write(store.state / "sync.json", json.dumps(result, ensure_ascii=True).encode())
     return result
@@ -255,7 +263,7 @@ def _synchronize(store):
         with store._locked():
             store._recover()
             if store._head() != head or store._ref() != ref or store._pending_entries():
-                return _save(store, {**result, "state": "retry", "stage": stage})
+                return _save_locked(store, {**result, "state": "retry", "stage": stage})
             _clean(store)
             entries = _checkout_entries(store, head, merged)
             if merged != head:
@@ -265,7 +273,7 @@ def _synchronize(store):
                 store._checkpoint("sync_prepared")
                 recover_checkout(store, txn)
             result["applied"] = True
-        return _save(store, {**result, "state": "synced", "stage": "complete"})
+            return _save_locked(store, {**result, "state": "synced", "stage": "complete"})
     except VaultError as exc:
         # Never persist stderr: transport errors may embed credential-bearing URLs.
         return _save(store, {**result, "state": "blocked" if exc.code in ("EXTERNAL_CHANGES", "UNSUPPORTED_TREE", "RECOVERY_CONFLICT", "SYNC_CONFIGURATION") else "error",

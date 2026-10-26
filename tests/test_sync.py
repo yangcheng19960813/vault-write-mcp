@@ -1,4 +1,6 @@
+from contextlib import contextmanager
 from dataclasses import replace
+import fcntl
 import json
 import multiprocessing
 import os
@@ -296,6 +298,113 @@ def test_status_distinguishes_new_writes_and_changed_target(pair):
     other = VaultStore(writer.root, replace(SYNC, sync=SyncConfig(enabled=True, main_branch="other")))
     assert other.sync_status()["state"] == "idle"
     assert not other.sync_status()["current"]
+
+
+@pytest.mark.parametrize("outcome", ["synced", "retry", "conflict", "error", "blocked"])
+def test_sync_status_persistence_holds_recovery_lock(pair, monkeypatch, outcome):
+    _, main, writer = pair
+    if outcome == "conflict":
+        write(main, "note.md", "human\n", "human")
+        publish(main)
+        write(writer, "note.md", "agent\n", "agent")
+    elif outcome == "blocked":
+        (writer.root / "external.md").write_text("external")
+    if outcome in ("retry", "error"):
+        original_git = writer._git
+        def changed_or_failed_push(*args, **kwargs):
+            if args[0] == "push":
+                if outcome == "error":
+                    raise VaultError("GIT_ERROR", "offline")
+                if args[-1].endswith(":refs/heads/main"):
+                    write(writer, "during.md", "during", "during")
+            return original_git(*args, **kwargs)
+        monkeypatch.setattr(writer, "_git", changed_or_failed_push)
+
+    original_write = writer._atomic_write
+    saved = []
+    def checked_write(path, data, mode=0o600):
+        if path == writer.state / "sync.json":
+            # A separate open file description must not acquire the lock:
+            # recovery could otherwise reap this live registered tempfile.
+            with (writer.state / "write.lock").open("rb") as probe:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            saved.append(json.loads(data))
+        return original_write(path, data, mode)
+    monkeypatch.setattr(writer, "_atomic_write", checked_write)
+    result = writer.sync()
+    assert result["state"] == outcome, result
+    assert len(saved) == 1 and saved[0]["state"] == outcome
+
+
+@pytest.mark.parametrize("operation", ["sync_status", "read_note"])
+def test_concurrent_recovery_does_not_reap_live_sync_status_temp(pair, monkeypatch, operation):
+    _, _, writer = pair
+    write(writer, "agent.md", "agent", "agent")
+    reader = VaultStore(writer.root, SYNC)
+    registered, release, attempting_read = (threading.Event() for _ in range(3))
+    original_write = writer._atomic_write
+    writing_status = False
+    def paused_write(path, data, mode=0o600):
+        nonlocal writing_status
+        writing_status = path == writer.state / "sync.json"
+        try:
+            return original_write(path, data, mode)
+        finally:
+            writing_status = False
+    def pause_registered(stage):
+        if writing_status and stage == "atomic_registered" and not registered.is_set():
+            registered.set()
+            assert release.wait(15)
+    monkeypatch.setattr(writer, "_atomic_write", paused_write)
+    monkeypatch.setattr(writer, "_checkpoint", pause_registered)
+    original_lock = reader._locked
+    @contextmanager
+    def observed_lock():
+        attempting_read.set()
+        with original_lock():
+            yield
+    monkeypatch.setattr(reader, "_locked", observed_lock)
+    results, reads, errors = [], [], []
+    def sync():
+        try:
+            results.append(writer.sync())
+        except BaseException as exc:
+            errors.append(exc)
+    def read():
+        try:
+            reads.append(reader.sync_status() if operation == "sync_status" else reader.read_note("agent.md"))
+        except BaseException as exc:
+            errors.append(exc)
+    syncing = threading.Thread(target=sync)
+    reading = threading.Thread(target=read)
+    syncing.start()
+    try:
+        assert registered.wait(15)
+        # Assert mutual exclusion without relying on scheduling or sleeps.
+        # Probe before starting the reader so only the saving thread can own it.
+        with (writer.state / "write.lock").open("rb") as probe:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        reading.start()
+        assert attempting_read.wait(15)
+    finally:
+        release.set()
+        syncing.join(20)
+        if reading.ident is not None:
+            reading.join(20)
+    assert not syncing.is_alive() and not reading.is_alive()
+    assert not errors, errors
+    assert results[0]["state"] == "synced", results
+    assert results[0]["published"] and results[0]["applied"]
+    if operation == "sync_status":
+        assert reads[0]["current"] and reads[0]["state"] == "synced"
+    else:
+        assert reads[0]["content"] == "agent"
+    assert writer.sync_status()["state"] == "synced"
+    assert not list(writer.state.glob("atomic-*.tmp"))
+    with writer._db() as db:
+        assert db.execute("SELECT COUNT(*) FROM atomic_files").fetchone()[0] == 0
 
 
 def test_custom_merge_driver_and_hooks_never_execute(pair):
