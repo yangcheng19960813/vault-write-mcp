@@ -6,3 +6,4 @@ dist/
 *.egg-info/
 .env
 .coverage
+.DS_Store
