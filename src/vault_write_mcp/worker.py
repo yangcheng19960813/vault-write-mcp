@@ -13,9 +13,14 @@ class CommitWorker:
         self._thread = threading.Thread(target=self._run, name="vault-write-commits", daemon=True)
 
     def tick(self):
+        if self.store.settings.sync.enabled:
+            result = self.store.sync()
+            if result["state"] in ("error", "blocked", "conflict"):
+                logging.warning("Git sync is %s; writer branch remains writable.", result["state"])
+            return result
         if self.store.settings.commit.mode == "interval":
             self.store.flush()
-        self.store.push()
+        return self.store.push()
 
     def _run(self):
         while not self._stop.wait(self.store.settings.commit.interval_seconds):

@@ -26,11 +26,16 @@ def endpoint(tmp_path, request):
     token = None if mode in ("no-auth", "interval-no-auth") else "integration-test-token"
     log = tmp_path / ".git" / "server-test.log"
     command = [sys.executable, "-m", "vault_write_mcp.server", "serve", "--vault", str(tmp_path), "--port", str(port)]
-    if mode in ("interval", "no-auth", "interval-no-auth"):
+    if mode in ("interval", "no-auth", "interval-no-auth", "sync"):
         config = tmp_path / ".git/server-test.toml"
         text = '[auth]\nenabled=false\n' if token is None else ""
         if mode in ("interval", "interval-no-auth"):
             text += '[commit]\nmode="interval"\ninterval_seconds=1\n'
+        if mode == "sync":
+            bare = tmp_path / ".git/http-remote.git"
+            for args in (("init", "--bare", str(bare)), ("remote", "add", "origin", str(bare)), ("push", "origin", "main"), ("branch", "-m", "ubuntu")):
+                subprocess.run(["git", "-C", str(tmp_path), *args], check=True, capture_output=True)
+            text += '[commit]\ninterval_seconds=1\n[push]\nenabled=true\n[sync]\nenabled=true\n'
         config.write_text(text)
         command.extend(["--config", str(config)])
     env = dict(os.environ)
@@ -84,9 +89,12 @@ async def test_real_mcp_handshake_auth_schema_and_version_errors(endpoint):
             assert (await http.post(url, headers={"Authorization": "Bearer wrong"}, json={})).status_code == 401
     async with client(endpoint) as session:
         tools = {tool.name: tool for tool in (await session.list_tools()).tools}
-        assert set(tools) == {"read_note", "write_note", "append_note", "note_history"}
-        for name in ("write_note", "append_note"):
+        assert set(tools) == {"read_note", "read_note_range", "find_note", "write_note", "append_note", "patch_note", "note_history", "sync_status"}
+        for name in ("write_note", "append_note", "patch_note"):
             assert {"expected_version", "request_id", "actor"} <= set(tools[name].inputSchema["required"])
+        status = await session.call_tool("sync_status", {})
+        assert not status.isError and not status.structuredContent["enabled"]
+        assert status.structuredContent["pending_count"] == 0
         missing = await session.call_tool("write_note", {"path": "note.md", "content": "bad", "request_id": "bad", "actor": "test"})
         assert missing.isError
         absent = await session.call_tool("read_note", {"path": "note.md"})
@@ -105,6 +113,28 @@ async def test_real_mcp_handshake_auth_schema_and_version_errors(endpoint):
         assert stale.structuredContent["error"]["code"] == "VERSION_CONFLICT"
         history = await session.call_tool("note_history", {"path": "note.md"})
         assert len(history.structuredContent["commits"]) == 1
+
+
+@pytest.mark.parametrize("endpoint", [None, "no-auth", "interval"], indirect=True)
+async def test_bounded_patch_tools_work_over_real_mcp_and_reject_conflicts(endpoint):
+    async with client(endpoint) as session:
+        created = await session.call_tool("write_note", {"path": "note.md", "content": "# Header\nline to find\nkeep\n", "expected_version": "missing", "request_id": "create", "actor": "test"})
+        found = (await session.call_tool("find_note", {"path": "note.md", "text": "line to find"})).structuredContent
+        assert len(found["matches"]) == 1 and "content" not in found
+        current = (await session.call_tool("read_note_range", {"path": "note.md", "start_line": 2, "max_lines": 1})).structuredContent
+        assert len(current["lines"]) == 1 and current["next_line"] == 3
+        assert current["version"] == created.structuredContent["version"]
+        args = {"path": "note.md", "edits": [{"op": "SWAP", "anchor": found["matches"][0].split("|", 1)[0], "lines": ["replaced"]}], "expected_version": current["version"], "request_id": "patch", "actor": "test"}
+        result = await session.call_tool("patch_note", args)
+        assert not result.isError and result.structuredContent["changed"]
+        assert (await session.call_tool("patch_note", args)).structuredContent["replayed"]
+        stale = await session.call_tool("patch_note", {**args, "request_id": "stale"})
+        assert stale.isError and stale.structuredContent["error"]["code"] == "VERSION_CONFLICT"
+        final = (await session.call_tool("read_note", {"path": "note.md"})).structuredContent
+        assert final["content"] == "# Header\nreplaced\nkeep\n"
+        invalid = await session.call_tool("patch_note", {**args, "expected_version": final["version"], "request_id": "typo", "edits": [{**args["edits"][0], "unknown_field": "typo"}]})
+        assert invalid.isError
+        assert (await session.call_tool("read_note", {"path": "note.md"})).structuredContent["version"] == final["version"]
 
 
 @pytest.mark.parametrize("endpoint", [None, "no-auth"], indirect=True)
@@ -184,3 +214,20 @@ def test_no_auth_rejects_other_bind_addresses_before_opening_vault(tmp_path, hos
     assert result.returncode == 2
     assert "loopback or Tailscale IPv4" in result.stderr
     assert not vault.exists()
+
+
+@pytest.mark.parametrize("endpoint", ["sync"], indirect=True)
+async def test_sync_worker_and_status_over_real_mcp(endpoint):
+    async with client(endpoint) as session:
+        created = await session.call_tool("write_note", {"path": "note.md", "content": "saved", "expected_version": "missing", "request_id": "sync-create", "actor": "test"})
+        assert not created.isError
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            state = (await session.call_tool("sync_status", {})).structuredContent
+            assert state["enabled"] and state["writer_commit"] == created.structuredContent["commit"]
+            if state["current"]:
+                break
+            await asyncio.sleep(0.1)
+        else:
+            pytest.fail("Sync worker did not publish the note: " + str(state))
+        assert state["published"] and state["applied"] and state["state"] == "synced"

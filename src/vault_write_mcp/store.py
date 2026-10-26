@@ -74,8 +74,15 @@ class VaultStore:
             self._ref()
             self._head()
             self._recover()
+            if self.settings.sync.enabled:
+                from .sync import validate_branch
+                validate_branch(self)
 
-    def _git(self, *args: str, data: bytes | None = None, index: Path | None = None) -> bytes:
+    def _git(self, *args: str, **kwargs) -> bytes:
+        return self._git_run(*args, **kwargs).stdout
+
+    def _git_run(self, *args: str, data: bytes | None = None, index: Path | None = None,
+                 cwd: Path | None = None, allowed_codes: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess:
         env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         env.update({
             "GIT_AUTHOR_NAME": "VaultWrite", "GIT_AUTHOR_EMAIL": "vaultwrite@localhost",
@@ -83,7 +90,7 @@ class VaultStore:
             "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": os.devnull,
         })
-        if args and args[0] == "push":
+        if args and args[0] in ("push", "fetch") and cwd is None:
             # Git authentication and URL aliases often live in the user's config.
             env.pop("GIT_CONFIG_GLOBAL")
             for name in ("GIT_CONFIG_GLOBAL", "GIT_ASKPASS", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_SSH_VARIANT"):
@@ -95,13 +102,13 @@ class VaultStore:
             result = subprocess.run(
                 ["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
                  "--literal-pathspecs", *args],
-                cwd=self.root, env=env, input=data, capture_output=True, timeout=30,
+                cwd=cwd or self.root, env=env, input=data, capture_output=True, timeout=30,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise VaultError("GIT_ERROR", str(exc)) from exc
-        if result.returncode:
+        if result.returncode not in allowed_codes:
             raise VaultError("GIT_ERROR", result.stderr.decode(errors="replace").strip() or "Git command failed.")
-        return result.stdout
+        return result
 
     def _head(self) -> str:
         return self._git("rev-parse", "--verify", "HEAD").decode().strip()
@@ -226,8 +233,18 @@ class VaultStore:
         return flush(self)
 
     def push(self) -> dict:
+        if self.settings.sync.enabled:
+            return self.sync()
         from .batch import push
         return push(self)
+
+    def sync(self) -> dict:
+        from .sync import synchronize
+        return synchronize(self)
+
+    def sync_status(self) -> dict:
+        from .sync import status
+        return status(self)
 
     def _checkpoint(self, stage: str) -> None:
         """Overridden by failure-injection tests; no runtime bypass or failpoint."""
@@ -236,6 +253,10 @@ class VaultStore:
         if not self.journal.exists():
             return
         txn = json.loads(self.journal.read_text(encoding="utf-8"))
+        if txn.get("kind") == "sync_checkout":
+            from .sync import recover_checkout
+            recover_checkout(self, txn)
+            return
         if txn.get("kind") in ("pending_write", "batch_commit"):
             from .batch import recover_transaction
             recover_transaction(self, txn)
@@ -270,6 +291,20 @@ class VaultStore:
             data = self._read(self._path(path))
             return {"path": path, "exists": data is not None, "content": None if data is None else data.decode("utf-8"), "version": version(data)}
 
+    def read_note_range(self, path: str, start_line: int = 1, max_lines: int = 80) -> dict:
+        from .editing import read_range
+        with self._locked():
+            self._recover()
+            data = self._read(self._path(path))
+            return {"path": path, "exists": data is not None, "version": version(data), **read_range(data, start_line, max_lines)}
+
+    def find_note(self, path: str, text: str, start_line: int = 1, max_matches: int = 10) -> dict:
+        from .editing import find_lines
+        with self._locked():
+            self._recover()
+            data = self._read(self._path(path))
+            return {"path": path, "exists": data is not None, "version": version(data), **find_lines(data, text, start_line, max_matches)}
+
     def _prepare_commit(self, path: str, content: bytes, head: str, mode: str, actor: str, request_id: str, operation: str) -> tuple[str, str]:
         fd, temporary = tempfile.mkstemp(prefix="index-", dir=self.state)
         os.close(fd)
@@ -297,17 +332,21 @@ class VaultStore:
     def append_note(self, path: str, content: str, expected_version: str, request_id: str, actor: str) -> dict:
         return self._mutate("append", path, content, expected_version, request_id, actor)
 
-    def _mutate(self, operation: str, path: str, content: str, expected_version: str, request_id: str, actor: str) -> dict:
+    def patch_note(self, path: str, edits: list[dict], expected_version: str, request_id: str, actor: str) -> dict:
+        from .editing import validate_edits
+        return self._mutate("patch", path, validate_edits(edits), expected_version, request_id, actor)
+
+    def _mutate(self, operation: str, path: str, content: str | list[dict], expected_version: str, request_id: str, actor: str) -> dict:
         if not isinstance(expected_version, str) or not re.fullmatch(r"missing|sha256:[0-9a-f]{64}", expected_version):
             raise VaultError("INVALID_VERSION", "expected_version must be 'missing' or a read_note SHA-256 version; bypasses are not supported.")
         if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", request_id):
             raise VaultError("INVALID_REQUEST_ID", "request_id must contain 1–128 ASCII letters, digits, or _ . : -.")
         if not isinstance(actor, str) or not re.fullmatch(r"[A-Za-z0-9_.@:-]{1,64}", actor):
             raise VaultError("INVALID_ACTOR", "actor must contain 1–64 ASCII letters, digits, or _ . @ : -.")
-        if not isinstance(content, str):
+        if operation != "patch" and not isinstance(content, str):
             raise VaultError("INVALID_CONTENT", "content must be a UTF-8 string.")
         try:
-            encoded = content.encode("utf-8")
+            encoded = (json.dumps(content, ensure_ascii=False) if operation == "patch" else content).encode("utf-8")
         except UnicodeEncodeError as exc:
             raise VaultError("INVALID_ENCODING", "content must be valid UTF-8.") from exc
         if len(encoded) > self.MAX_BYTES:
@@ -315,6 +354,9 @@ class VaultStore:
         fingerprint = hashlib.sha256(json.dumps([operation, path, content, expected_version, actor], ensure_ascii=True).encode()).hexdigest()
         with self._locked():
             self._recover()
+            if self.settings.sync.enabled:
+                from .sync import validate_branch
+                validate_branch(self)
             target = self._path(path)
             previous = self._receipt(request_id, fingerprint)
             if previous is not None:
@@ -324,9 +366,13 @@ class VaultStore:
             old = self._read(target)
             if version(old) != expected_version:
                 raise VaultError("VERSION_CONFLICT", "Re-read the note, merge your change, and retry.", current_version=version(old))
-            if operation == "append" and old is None:
-                raise VaultError("NOT_FOUND", "Create the note with write_note before appending.")
-            new = (old or b"") + encoded if operation == "append" else encoded
+            if operation in ("append", "patch") and old is None:
+                raise VaultError("NOT_FOUND", "Create the note with write_note before appending or patching.")
+            if operation == "patch":
+                from .editing import apply_patch
+                new = apply_patch(old, content)
+            else:
+                new = (old or b"") + encoded if operation == "append" else encoded
             if len(new) > self.MAX_BYTES:
                 raise VaultError("TOO_LARGE", "The resulting note exceeds 1 MiB.")
             head, ref = self._head(), self._ref()

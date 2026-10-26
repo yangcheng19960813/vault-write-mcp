@@ -847,6 +847,7 @@ source = { editable = "." }
 dependencies = [
     { name = "httpx" },
     { name = "mcp" },
+    { name = "pydantic" },
     { name = "uvicorn" },
 ]
 
@@ -862,6 +863,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28,<1" },
     { name = "httpx", marker = "extra == 'test'", specifier = ">=0.28,<1" },
     { name = "mcp", specifier = ">=1.30,<2" },
+    { name = "pydantic", specifier = ">=2.11,<3" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8,<10" },
     { name = "pytest-asyncio", marker = "extra == 'test'", specifier = ">=0.25,<2" },
     { name = "uvicorn", specifier = ">=0.35,<1" },

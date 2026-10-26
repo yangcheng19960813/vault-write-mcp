@@ -69,6 +69,7 @@ uv run vault-write-mcp serve --vault /path/to/test-vault --config /path/to/vault
 | `model.failure_policy` | `fallback` | `fallback` 使用默认信息；`defer` 失败后保留改动，等待下次尝试 |
 | `push.enabled` / `push.remote` | `false` / `origin` | 自动推送开关与已配置的 Git remote 名称 |
 | `push.branch` | 空 | 空值跟随当前分支，也可指定远端目标分支 |
+| `sync.enabled` / `sync.main_branch` | `false` / `main` | 开启双分支同步；要求 push.enabled，当前写入分支与 main 不同 |
 
 模型功能启用时，从配置指定的环境变量读取 Key；TOML 不接受明文 `api_key` 字段。服务的 `VAULT_WRITE_TOKEN` 与模型 API Key 是两份独立凭据。配置加载失败或开启模型但缺少 Key 时，启动会报错。修改配置后需重启服务。
 
@@ -86,30 +87,94 @@ uv run vault-write-mcp serve --vault /path/to/test-vault --config /path/to/vault
 uv run vault-write-mcp flush --vault /path/to/test-vault --config /path/to/vault-write.toml
 ```
 
-`flush` 不需要 MCP 鉴权令牌；它会按同一配置生成待提交批次，并在启用 push 时尝试推送。定时线程仅在 `serve` 期间运行，停止服务不会额外触发提交，下次启动后继续按周期检查。模型请求和 Git 操作期间会持有同库锁，较慢的接口会暂时延后其他读写。
+`flush` 无需 MCP 令牌；它提交批次并按配置 push，启用 sync 时协调完整同步。后台只在 serve 期间运行；批次提交和模型请求仍持有同库锁，双分支同步的网络与隔离合并不持有写锁。
+
 
 `failure_policy = "defer"` 时，模型失败不创建提交、不清除待提交批次，后台在下个周期再尝试；逐次模式则拒绝本次写入，文件保持原样。`fallback` 会使用默认信息继续提交。模型返回的内容只作为单行提交主题使用，不能执行 Git 或文件操作。
 
 ### 自动 push
 
-启用前先在测试 Vault 配好 remote 与 Git 认证。服务只做普通 push，不 force、不 pull，不自动解决远端分歧。首次启用会推送当前 HEAD 及其历史；之后只有 HEAD 或推送目标发生变化时才推送。自动 push 的检查周期复用 `commit.interval_seconds`。
+未启用 sync 时，服务只做普通 push，不 force、不 pull，不自动解决远端分歧。先在测试 Vault 配好 remote 与 Git 认证；首次推送当前 HEAD 及历史，之后仅 HEAD 或目标变化时推送。检查周期复用 commit.interval_seconds。
+
 
 成功推送的检查点保存在 `.git/vault-write/push.json`，重启后沿用。推送失败不会撤销本地提交，也不会重新调用模型生成信息；后台在下个周期重试。API Key 不参与 Git 认证。
+
+### 双分支同步（默认关闭）
+
+需要 Git 2.38+（`merge-tree --write-tree`）。本地人工编辑 main，服务独占另一个普通 clone 的 ubuntu 分支；QMD 使用独立 main 只读副本。本功能不创建或切换分支，不部署正式环境。先在隔离测试远端准备副本：
+
+```sh
+git clone --branch main /path/to/test-remote.git /tmp/vault-write-ubuntu
+git -C /tmp/vault-write-ubuntu switch -c ubuntu
+```
+
+配置 `[push] enabled=true`、`remote="origin"`、`branch=""`；配置 `[sync] enabled=true`、`main_branch="main"`。当前写入分支必须与 main 不同，push.branch 只能为空或等于写入分支。同步周期沿用 commit.interval_seconds；CLI 可直接执行：
+
+```sh
+uv run vault-write-mcp sync --vault /tmp/vault-write-ubuntu --config /path/to/vault-write.toml
+uv run vault-write-mcp sync-status --vault /tmp/vault-write-ubuntu --config /path/to/vault-write.toml
+```
+
+每轮提交 interval 批次，将固定写入快照普通推送到 ubuntu，再获取 main，在临时 bare 库合并，普通推送结果到 main。网络及隔离合并不占写锁，多进程同步由独立 sync.lock 串行协调。应用前重新核对写入分支、HEAD、待提交批次及外部改动；期间出现新写入则保留新内容，下轮接续。
+
+冲突只阻塞同步，写入、提交及 ubuntu 推送继续；真实笔记不出现合并冲突标记。用户在自己的 main 副本 fetch ubuntu，merge 后人工解决并正常 push main；服务下一轮重新合并最新双方历史，保留冲突期间新增提交。不会 force push、自动选择 ours/theirs 或请求模型裁决正文。
+
+写入成功仅表示已保存。只读 MCP sync_status 与 CLI 状态显示最后一轮 last_state、快照、published/applied、target、completed_at（UTC），以及当前 writer_commit、pending_count、current。上轮成功后有新写入时 state 为 pending、current 为 false；目标配置变化回到 idle。current 仅确认已知发布快照与当前写入提交相符，不代表刚查询过远端。冲突提供最多 50 个路径及总数，错误保存阶段与错误码，不保存可能含凭据的 transport stderr。状态读取不触发网络或模型请求。
+
+应用使用 sync_checkout 持久事务，逐文件落盘后更新 ref/index；进程退出后沿 pending.json 恢复，外部正文或索引变化会保留现场并拒绝覆盖。同步支持普通 Git 文件，包括隐藏配置和二进制附件，保持原始字节及权限；拒绝符号链接、gitlink、路径逃逸、大小写/Unicode 规范化碰撞和文件/目录拓扑转换。外部暂存、未跟踪及未提交修改会阻塞应用；MCP 写入 API 仍只接受可见 UTF-8 Markdown。
+
 
 ## 工具
 
 | 工具 | 参数 | 行为 |
 | --- | --- | --- |
 | `read_note` | `path` | 返回正文、`exists` 和当前 `version`；不存在时版本为 `missing` |
+| `read_note_range` | `path`, `start_line=1`, `max_lines=80` | 返回带锚点的局部行和整篇版本；最多 200 行、16 KiB |
+| `find_note` | `path`, `text`, `start_line=1`, `max_matches=10` | 在一篇笔记内做区分大小写的字面查找，返回命中行和整篇版本；最多 50 个命中、16 KiB |
 | `write_note` | `path`, `content`, `expected_version`, `request_id`, `actor` | 创建或整篇替换；版本必须匹配 |
 | `append_note` | 同上 | 在版本检查和同一把锁内读取、拼接、写回；原样追加，不自动补换行 |
+| `patch_note` | `path`, `edits`, `expected_version`, `request_id`, `actor` | 根据行锚点原子替换、删除、插入；所有操作成功才落盘 |
 | `note_history` | `path`, `limit=20` | 返回修改该笔记的 Git 提交，最多 100 条 |
+| `sync_status` | 无 | 只读同步状态、当前写入提交与待提交数，不触发同步 |
 
 现有笔记的版本形如 `sha256:<64 位小写十六进制>`，按原始 UTF-8 字节计算。创建新笔记也必须显式提交 `expected_version: "missing"`；它只能匹配真正不存在的文件。服务不提供 `blind`、强制覆盖或关闭版本校验的参数。BOM、CRLF 和末尾换行会原样保留。
 
 逐次模式成功写入返回 `version`、`commit`、`changed`、`request_id` 和 `replayed`。正文没有变化时 `changed: false`，不会额外创建空提交。该模式的提交只包含该笔记，正文记录 `VaultWrite-Actor` 和 `VaultWrite-Request`；定时模式的批次提交记录涉及的 actor 和请求编号。
 
 `actor` 是调用方提供的审计标签，不是经过独立认证的用户身份。默认使用共享 bearer token；私网可按上述配置关闭认证。
+
+### 局部读取与锚点修改
+
+优先用 `find_note` 定位关键词，再用 `read_note_range` 读取附近行。两者仅返回局部内容和**整篇**内容版本，不需要把整篇笔记放进模型上下文。`lines`/`matches` 中每项格式为 `行号:12位哈希|正文`；哈希包含该行的换行符。返回 `next_line` 时，使用它作为下一次的 `start_line` 继续读取/查找；`null` 表示本次请求范围内已读完。超出文件尾返回空列表。
+
+例如先读取 `{"path":"notes/demo.md","start_line":20,"max_lines":5}`，从返回行 `20:0123456789ab|旧标题` 复制竖线前的锚点，并携带该次返回的真实版本：
+
+```json
+{
+  "path": "notes/demo.md",
+  "expected_version": "sha256:<读取结果中的完整版本>",
+  "request_id": "<本次操作的唯一编号>",
+  "actor": "codex",
+  "edits": [
+    {"op": "SWAP", "anchor": "20:0123456789ab", "lines": ["新标题"]}
+  ]
+}
+```
+
+示例中的哈希和版本是占位值，不能直接用于真实调用。这是 Hashline 风格的结构化接口，不与 Hashline 的补丁字符串或锚点哈希互通；不需要启动另一个 MCP。
+
+| `op` | 行为 | 其他字段 |
+| --- | --- | --- |
+| `SWAP` | 替换单行或包含两端的行区间 | `lines` 为新行数组；可选 `end_anchor` |
+| `DEL` | 删除单行或包含两端的行区间 | 不传 `lines`；可选 `end_anchor` |
+| `INS.PRE` | 在锚点行前插入 | 只传单个 `anchor` 与 `lines` |
+| `INS.POST` | 在锚点行后插入 | 只传单个 `anchor` 与 `lines` |
+
+`lines` 每项不含 CR/LF，空字符串表示空白行；插入和替换要求至少一行。每次接受 1–100 个操作，全部锚点指向**修改前同一个快照**，不用随着前面的插入重新计算行号。区间重叠、两个操作复用同一锚点行、未知字段、错误哈希均拒绝整次请求，失败前不写入任何一部分。
+
+新行沿用目标位置的 LF/CRLF；未触及的字节和 UTF-8 BOM 保留，替换及尾部插入保留原文件的末尾换行状态。空文件、仅含 BOM 的文件和不存在的文件没有行锚点，使用 `write_note` 新建内容。单行超过 16 KiB 读取上限时明确返回 `LINE_TOO_LONG`，不截断后生成不完整锚点；这类笔记可使用原有 `read_note`/`write_note`。
+
+补丁仍要求整篇版本完全匹配：其他 agent 即使只改了另一行，旧版本也返回 `VERSION_CONFLICT`。版本相符但锚点不符返回 `ANCHOR_CONFLICT`；重新读取受影响片段并整合后，用新编号重试。成功结果只返回版本、提交/待提交状态等信息，不回传整篇正文；重放、批次提交、原子落盘与 Git 恢复沿用已有事务。
 
 ## 冲突与重试
 
@@ -160,7 +225,7 @@ git -C /tmp/vault-write-demo show <commit>:notes/example.md
 - 已有暂存修改会拒写；目标笔记有服务之外的未提交改动或尚未跟踪时也会拒写，保留外部编辑。定时模式只接纳本服务已登记的待提交内容。其他文件未暂存的修改和未跟踪文件会保留，不纳入服务提交。
 - 不支持 Git 内容过滤器或工作区编码转换、linked worktree、bare 仓库、Windows、NFS 或多机器直接共享文件锁。
 - **并发保证只覆盖统一通过本服务的写入。** Shell、编辑器、Obsidian、其他 MCP、Git pull/reset 和同步程序直接改同一副本会绕过锁。正式接管前需统一写入口并协调现有同步任务。
-- 自动 push 可按上述配置启用；没有自动 pull、正式库迁移、跨请求的批量原子写接口、删除、重命名和服务常驻配置。QMD 继续负责检索，写入前须通过本服务读取最新正文。
+- 自动 push 和双分支同步可按上述配置启用；没有正式库迁移、跨请求的批量原子写接口、删除/重命名写入 API 和服务常驻配置。QMD 继续负责检索。
 
 ## 验证
 
@@ -168,6 +233,6 @@ git -C /tmp/vault-write-demo show <commit>:notes/example.md
 uv run pytest -q
 ```
 
-测试使用临时隔离 Git 库：版本校验、跨进程并发与冲突重试、不同文件并发、去重回执、Git 失败回滚、实际进程中断恢复、中文路径与字节保留、路径限制，以及真实 HTTP MCP 握手、鉴权和两个独立客户端。
+测试使用临时隔离 Git 库：版本校验、局部读取上限、锚点修改与整次拒绝、跨进程并发与冲突重试、不同文件并发、去重回执、Git 失败回滚、实际进程中断恢复、中文路径与字节保留、路径限制，以及真实 HTTP MCP 握手、鉴权和两个独立客户端。
 
 项目附带 Linux/macOS 的 GitHub Actions 工作流；本地通过不代表远端 CI 已运行。

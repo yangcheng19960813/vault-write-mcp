@@ -22,6 +22,7 @@ import uvicorn
 from .store import VaultError, VaultStore, init_vault
 from .config import load_settings
 from .worker import CommitWorker
+from .editing import LineEdit
 
 
 class BearerAuth:
@@ -63,7 +64,7 @@ def create_app(store: VaultStore, token: str, host: str = "127.0.0.1", port: int
         allowed_hosts.append(f"localhost:{port}")
     mcp = FastMCP(
         "VaultWrite", stateless_http=True, json_response=True,
-        instructions="Read the latest version before writing. Every write and append requires expected_version, actor, and request_id. On VERSION_CONFLICT, re-read, merge and retry with a new request_id. For a transport failure, retry the identical request_id and arguments.",
+        instructions="Prefer find_note and read_note_range for bounded line reads, then patch_note for local edits. Copy line:hash anchors exactly. Every write, append and patch requires expected_version, actor, and request_id. On VERSION_CONFLICT or ANCHOR_CONFLICT, re-read the affected range, merge and retry with a new request_id. For a transport failure, retry the identical request_id and arguments.",
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=True, allowed_hosts=allowed_hosts, allowed_origins=[]),
     )
 
@@ -84,6 +85,16 @@ def create_app(store: VaultStore, token: str, host: str = "127.0.0.1", port: int
         return await invoke(store.read_note, path=path)
 
     @mcp.tool()
+    async def read_note_range(path: str, start_line: int = 1, max_lines: int = 80) -> CallToolResult:
+        """Read up to 200 lines as line:hash|text, with the whole-note version. Output is capped at 16 KiB of rendered lines. Continue at next_line when set. Missing/empty notes have no anchors; create them with write_note."""
+        return await invoke(store.read_note_range, path=path, start_line=start_line, max_lines=max_lines)
+
+    @mcp.tool()
+    async def find_note(path: str, text: str, start_line: int = 1, max_matches: int = 10) -> CallToolResult:
+        """Find literal, case-sensitive text in one note; return matching line:hash|text and the whole-note version. No regex or model calls. Continue at next_line or read context with read_note_range."""
+        return await invoke(store.find_note, path=path, text=text, start_line=start_line, max_matches=max_matches)
+
+    @mcp.tool()
     async def write_note(path: str, content: str, expected_version: str, request_id: str, actor: str) -> CallToolResult:
         """Create or replace a note with a mandatory version check. Use 'missing' only to create an absent note. Keep request_id and all arguments identical when retrying a transport failure."""
         return await invoke(store.write_note, path=path, content=content, expected_version=expected_version, request_id=request_id, actor=actor)
@@ -94,9 +105,19 @@ def create_app(store: VaultStore, token: str, host: str = "127.0.0.1", port: int
         return await invoke(store.append_note, path=path, content=content, expected_version=expected_version, request_id=request_id, actor=actor)
 
     @mcp.tool()
+    async def patch_note(path: str, edits: list[LineEdit], expected_version: str, request_id: str, actor: str) -> CallToolResult:
+        """Apply 1–100 edits atomically against the exact version. SWAP/DEL accept an optional inclusive end_anchor; INS.PRE/INS.POST insert around one anchor. lines contains newline-free strings (DEL omits it). All anchors refer to the original snapshot; overlapping ranges/anchors are rejected. Preserve BOM and untouched bytes; SWAP and tail insertion retain EOF newline. Re-read on conflicts; retry transport failures with identical arguments."""
+        return await invoke(store.patch_note, path=path, edits=[edit.model_dump(exclude_none=True) for edit in edits], expected_version=expected_version, request_id=request_id, actor=actor)
+
+    @mcp.tool()
     async def note_history(path: str, limit: int = 20) -> CallToolResult:
         """List up to 100 Git commits affecting a Markdown note, newest first."""
         return await invoke(store.note_history, path=path, limit=limit)
+
+    @mcp.tool()
+    async def sync_status() -> CallToolResult:
+        """Read sync state without network calls. Writes are saved locally and may not be published to main. last_state describes the last attempt; state=pending/current=false indicates newer writes. pending_count and writer_commit report local state; target and completed_at identify the last attempt."""
+        return await invoke(store.sync_status)
 
     app = mcp.streamable_http_app()
     if store.settings.commit.mode == "interval" or store.settings.push.enabled:
@@ -129,12 +150,22 @@ def main() -> None:
     flush = subparsers.add_parser("flush", help="Commit pending interval writes and optionally push.")
     flush.add_argument("--vault", required=True)
     flush.add_argument("--config", help="Use the same TOML configuration as serve.")
+    for name, help_text in (("sync", "Save pending writes and synchronize the writer branch with main."),
+                            ("sync-status", "Read synchronization state without fetching or pushing.")):
+        command = subparsers.add_parser(name, help=help_text)
+        command.add_argument("--vault", required=True)
+        command.add_argument("--config", help="Use the same TOML configuration as serve.")
     args = parser.parse_args()
     try:
         if args.command == "init":
             print(init_vault(args.vault))
             return
         settings = load_settings(args.config)
+        if args.command in ("sync", "sync-status"):
+            store = VaultStore(args.vault, settings)
+            result = store.sync() if args.command == "sync" else store.sync_status()
+            print(json.dumps(result, ensure_ascii=False))
+            return
         if args.command == "flush":
             store = VaultStore(args.vault, settings)
             print(json.dumps({"commit": store.flush(), "push": store.push()}, ensure_ascii=False))

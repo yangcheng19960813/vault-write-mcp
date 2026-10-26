@@ -4,7 +4,7 @@ enabled = true                 # 私网无令牌连接可设为 false；仅允�
 
 [commit]
 mode = "immediate"              # immediate / interval
-interval_seconds = 300          # interval 提交及自动 push 的检查周期
+interval_seconds = 300          # interval 提交、push 和双分支同步的检查周期
 
 [model]
 enabled = false
@@ -21,3 +21,7 @@ failure_policy = "fallback"    # fallback 用默认信息；defer 保留待提�
 enabled = false
 remote = "origin"              # Vault 内已经配置的 Git remote
 branch = ""                    # 空值跟随当前分支；不会 force push
+
+[sync]
+enabled = false                # 要求 push.enabled=true，独占写入副本
+main_branch = "main"           # 当前分支不能是 main；push.branch 为空或当前写入分支

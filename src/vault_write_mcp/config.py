@@ -77,6 +77,18 @@ class PushConfig:
 
 
 @dataclass(frozen=True)
+class SyncConfig:
+    enabled: bool = False
+    main_branch: str = "main"
+
+    def __post_init__(self):
+        if type(self.enabled) is not bool:
+            raise ValueError("sync.enabled must be a boolean.")
+        if not isinstance(self.main_branch, str) or not self.main_branch:
+            raise ValueError("sync.main_branch must be a nonempty branch name.")
+
+
+@dataclass(frozen=True)
 class AuthConfig:
     enabled: bool = True
 
@@ -91,6 +103,11 @@ class Settings:
     model: ModelConfig = field(default_factory=ModelConfig)
     push: PushConfig = field(default_factory=PushConfig)
     auth: AuthConfig = field(default_factory=AuthConfig)
+    sync: SyncConfig = field(default_factory=SyncConfig)
+
+    def __post_init__(self):
+        if self.sync.enabled and not self.push.enabled:
+            raise ValueError("sync.enabled requires push.enabled; push.remote is shared by both branches.")
 
 
 def load_settings(path: str | Path | None = None) -> Settings:
@@ -98,7 +115,7 @@ def load_settings(path: str | Path | None = None) -> Settings:
         return Settings()
     with Path(path).open("rb") as stream:
         data = tomllib.load(stream)
-    classes = {"commit": CommitConfig, "model": ModelConfig, "push": PushConfig, "auth": AuthConfig}
+    classes = {"commit": CommitConfig, "model": ModelConfig, "push": PushConfig, "auth": AuthConfig, "sync": SyncConfig}
     if set(data) - classes.keys():
         raise ValueError("Unknown configuration section.")
     sections = {}
