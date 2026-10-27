@@ -311,6 +311,10 @@ class VaultStore:
         if not self.journal.exists():
             return
         txn = json.loads(self.journal.read_text(encoding="utf-8"))
+        if txn.get("kind") == "move_note":
+            from .moving import recover_move
+            recover_move(self, txn)
+            return
         if txn.get("kind") == "sync_checkout":
             from .sync import recover_checkout
             recover_checkout(self, txn)
@@ -363,6 +367,15 @@ class VaultStore:
             self._recover()
             data = self._read(self._path(path))
             return {"path": path, "exists": data is not None, "version": version(data), **find_lines(data, text, start_line, max_matches, context_before, context_after)}
+
+    def preview_move_note(self, source: str, destination: str) -> dict:
+        from .moving import preview_move_note
+        return preview_move_note(self, source, destination)
+
+    def move_note(self, source: str, destination: str, expected_versions: dict[str, str], plan_version: str,
+                  request_id: str, actor: str) -> dict:
+        from .moving import move_note
+        return move_note(self, source, destination, expected_versions, plan_version, request_id, actor)
 
     def _prepare_commit(self, path: str, content: bytes, head: str, mode: str, actor: str, request_id: str, operation: str) -> tuple[str, str]:
         fd, temporary = tempfile.mkstemp(prefix="index-", dir=self.state)

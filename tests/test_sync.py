@@ -592,3 +592,20 @@ def test_private_unknown_temp_does_not_block_sync_or_change_saved_patch_context(
     assert replay["replayed"] and replay["result_context"] == first["result_context"] and replay["version"] == first["version"]
     assert unknown.read_bytes() == b"ownership cannot be proved"
     assert "atomic-" not in git(remote, "ls-tree", "-r", "--name-only", "main")
+
+
+def test_move_reference_commit_synchronizes_and_receipt_survives_merge(pair):
+    remote, main, writer = pair
+    write(writer, "ref.md", "[[note#heading|Label]]\n", "ref")
+    plan = writer.preview_move_note("note.md", "archive/moved.md")
+    first = writer.move_note(**{key: plan[key] for key in ("source", "destination", "expected_versions", "plan_version")}, request_id="move", actor="test")
+    write(main, "human.md", "unrelated human note\n", "human")
+    publish(main)
+    result = writer.sync()
+    assert result["state"] == "synced", result
+    assert writer.read_note("note.md")["version"] == "missing"
+    assert writer.read_note("archive/moved.md")["content"] == "base\n"
+    assert writer.read_note("ref.md")["content"] == "[[./archive/moved.md#heading|Label]]\n"
+    assert git(remote, "show", "main:ref.md") == "[[./archive/moved.md#heading|Label]]"
+    replay = writer.move_note(**{key: plan[key] for key in ("source", "destination", "expected_versions", "plan_version")}, request_id="move", actor="test")
+    assert replay == {**first, "replayed": True}

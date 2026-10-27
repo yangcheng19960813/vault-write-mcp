@@ -121,6 +121,18 @@ def create_app(store: VaultStore, token: str, host: str = "127.0.0.1", port: int
                             return_context=return_context, context_before=context_before, context_after=context_after)
 
     @mcp.tool()
+    async def preview_move_note(source: str, destination: str) -> CallToolResult:
+        """Preview a tracked Markdown move/rename and supported local reference updates without changing files. Returns plan_version and the exact expected_versions mapping required by move_note. Requires a clean vault and no pending interval batch. Rejects ambiguous/unsupported affected links; scans bounded tracked notes and assets."""
+        return await invoke(store.preview_move_note, source=source, destination=destination)
+
+    @mcp.tool()
+    async def move_note(source: str, destination: str, expected_versions: dict[str, str], plan_version: str,
+                        request_id: str, actor: str) -> CallToolResult:
+        """Apply a previewed move/rename plus supported inbound/outgoing reference updates in one recoverable transaction and one immediate Git commit. Copy preview plan_version and complete expected_versions exactly. No implicit interval flush. Re-preview conflicts; transport retries must retain all original arguments/request_id and replay the original durable receipt. Atomic through service locking/recovery, not simultaneous multi-file visibility to external readers."""
+        return await invoke(store.move_note, source=source, destination=destination, expected_versions=expected_versions,
+                            plan_version=plan_version, request_id=request_id, actor=actor)
+
+    @mcp.tool()
     async def note_history(path: str, limit: int = 20) -> CallToolResult:
         """List up to 100 Git commits affecting a Markdown note, newest first."""
         return await invoke(store.note_history, path=path, limit=limit)
