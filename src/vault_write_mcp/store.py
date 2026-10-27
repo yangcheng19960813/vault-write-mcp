@@ -71,6 +71,7 @@ class VaultStore:
                 db.execute("CREATE TABLE IF NOT EXISTS receipts (request_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT NOT NULL)")
                 db.execute("CREATE TABLE IF NOT EXISTS pending (path TEXT PRIMARY KEY, state TEXT NOT NULL)")
                 db.execute("CREATE TABLE IF NOT EXISTS pending_requests (request_id TEXT PRIMARY KEY, path TEXT NOT NULL)")
+                db.execute("CREATE TABLE IF NOT EXISTS atomic_files (name TEXT PRIMARY KEY, device INTEGER NOT NULL, inode INTEGER NOT NULL)")
             self._ref()
             self._head()
             self._recover()
@@ -179,20 +180,76 @@ class VaultStore:
                 _sync_directory(current)
             current = next_path
 
+    def _check_atomic_device(self, parent: Path) -> None:
+        # A private staging file can only be renamed atomically on the same
+        # filesystem. Never fall back to a non-atomic copy across a mount.
+        existing = parent
+        while not existing.exists():
+            existing = existing.parent
+        if existing.stat().st_dev != self.state.stat().st_dev:
+            raise VaultError("UNSUPPORTED_FILESYSTEM", "Managed notes and .git/vault-write must share a filesystem for atomic replacement.")
+
+    def _cleanup_atomic_files(self) -> None:
+        # An exact durable (name, device, inode) receipt is ownership evidence;
+        # neither a filename prefix nor a directory glob is sufficient.
+        with self._db() as db:
+            rows = db.execute("SELECT name, device, inode FROM atomic_files").fetchall()
+            for name, device, inode in rows:
+                if not re.fullmatch(r"atomic-[A-Za-z0-9_\-]+\.tmp", name):
+                    continue
+                temporary = self.state / name
+                try:
+                    info = temporary.lstat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    if stat.S_ISREG(info.st_mode) and info.st_dev == device and info.st_ino == inode and info.st_nlink == 1:
+                        temporary.unlink()
+                        _sync_directory(self.state)
+                    # A replaced path, hard link or symlink is not ours to
+                    # remove. Retain it, but don't block normal vault work.
+                db.execute("DELETE FROM atomic_files WHERE name = ?", (name,))
+
     def _atomic_write(self, path: Path, data: bytes, mode: int = 0o600) -> None:
+        self._check_atomic_device(path.parent)
         self._ensure_parent(path.parent)
-        fd, temporary = tempfile.mkstemp(prefix=".vault-write-", suffix=".tmp", dir=path.parent)
+        # Staging under .git means even a kill between creation and ownership
+        # registration cannot leak an untracked Markdown-directory tempfile
+        # into a later Git sync. Such unregistered private files are retained.
+        fd, temporary = tempfile.mkstemp(prefix="atomic-", suffix=".tmp", dir=self.state)
+        name = Path(temporary).name
+        owned = os.fstat(fd)
         try:
             with os.fdopen(fd, "wb") as stream:
+                self._checkpoint("atomic_created")
+                info = os.fstat(stream.fileno())
+                with self._db() as db:
+                    db.execute("INSERT INTO atomic_files VALUES (?, ?, ?)", (name, info.st_dev, info.st_ino))
+                _sync_directory(self.state)
+                self._checkpoint("atomic_registered")
                 os.fchmod(stream.fileno(), mode)
                 stream.write(data)
                 stream.flush()
                 os.fsync(stream.fileno())
+                self._checkpoint("atomic_fsynced")
             os.replace(temporary, path)
             _sync_directory(path.parent)
+            if path.parent != self.state:
+                _sync_directory(self.state)
+            self._checkpoint("atomic_replaced")
         finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
+            # The live process still owns this exact pathname. Recovery instead
+            # uses the durable inode receipt and never guesses by prefix.
+            try:
+                remaining = os.lstat(temporary)
+            except FileNotFoundError:
+                pass
+            else:
+                if stat.S_ISREG(remaining.st_mode) and (remaining.st_dev, remaining.st_ino) == (owned.st_dev, owned.st_ino) and remaining.st_nlink == 1:
+                    os.unlink(temporary)
+                    _sync_directory(self.state)
+            with self._db() as db:
+                db.execute("DELETE FROM atomic_files WHERE name = ?", (name,))
 
     def _clear_journal(self) -> None:
         self.journal.unlink()
@@ -250,6 +307,7 @@ class VaultStore:
         """Overridden by failure-injection tests; no runtime bypass or failpoint."""
 
     def _recover(self) -> None:
+        self._cleanup_atomic_files()
         if not self.journal.exists():
             return
         txn = json.loads(self.journal.read_text(encoding="utf-8"))
@@ -298,12 +356,13 @@ class VaultStore:
             data = self._read(self._path(path))
             return {"path": path, "exists": data is not None, "version": version(data), **read_range(data, start_line, max_lines)}
 
-    def find_note(self, path: str, text: str, start_line: int = 1, max_matches: int = 10) -> dict:
+    def find_note(self, path: str, text: str, start_line: int = 1, max_matches: int = 10,
+                  context_before: int = 0, context_after: int = 0) -> dict:
         from .editing import find_lines
         with self._locked():
             self._recover()
             data = self._read(self._path(path))
-            return {"path": path, "exists": data is not None, "version": version(data), **find_lines(data, text, start_line, max_matches)}
+            return {"path": path, "exists": data is not None, "version": version(data), **find_lines(data, text, start_line, max_matches, context_before, context_after)}
 
     def _prepare_commit(self, path: str, content: bytes, head: str, mode: str, actor: str, request_id: str, operation: str) -> tuple[str, str]:
         fd, temporary = tempfile.mkstemp(prefix="index-", dir=self.state)
@@ -332,11 +391,19 @@ class VaultStore:
     def append_note(self, path: str, content: str, expected_version: str, request_id: str, actor: str) -> dict:
         return self._mutate("append", path, content, expected_version, request_id, actor)
 
-    def patch_note(self, path: str, edits: list[dict], expected_version: str, request_id: str, actor: str) -> dict:
-        from .editing import validate_edits
-        return self._mutate("patch", path, validate_edits(edits), expected_version, request_id, actor)
+    def patch_note(self, path: str, edits: list[dict], expected_version: str, request_id: str, actor: str,
+                   return_context: bool = False, context_before: int = 0, context_after: int = 0) -> dict:
+        from .editing import validate_context, validate_edits
+        if type(return_context) is not bool:
+            raise VaultError("INVALID_CONTEXT", "return_context must be a boolean.")
+        validate_context(context_before, context_after)
+        if not return_context and (context_before or context_after):
+            raise VaultError("INVALID_CONTEXT", "Set return_context=true when requesting patch context.")
+        options = {"return_context": True, "context_before": context_before, "context_after": context_after} if return_context else None
+        return self._mutate("patch", path, validate_edits(edits), expected_version, request_id, actor, options)
 
-    def _mutate(self, operation: str, path: str, content: str | list[dict], expected_version: str, request_id: str, actor: str) -> dict:
+    def _mutate(self, operation: str, path: str, content: str | list[dict], expected_version: str, request_id: str, actor: str,
+                result_options: dict | None = None) -> dict:
         if not isinstance(expected_version, str) or not re.fullmatch(r"missing|sha256:[0-9a-f]{64}", expected_version):
             raise VaultError("INVALID_VERSION", "expected_version must be 'missing' or a read_note SHA-256 version; bypasses are not supported.")
         if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", request_id):
@@ -351,7 +418,13 @@ class VaultStore:
             raise VaultError("INVALID_ENCODING", "content must be valid UTF-8.") from exc
         if len(encoded) > self.MAX_BYTES:
             raise VaultError("TOO_LARGE", "Notes must be at most 1 MiB.")
-        fingerprint = hashlib.sha256(json.dumps([operation, path, content, expected_version, actor], ensure_ascii=True).encode()).hexdigest()
+        arguments = [operation, path, content, expected_version, actor]
+        # Keep the original default fingerprint, so receipts written by older
+        # servers remain replayable. Nondefault result options are semantic
+        # request arguments, not a view of whatever file exists on a retry.
+        if result_options is not None:
+            arguments.append(result_options)
+        fingerprint = hashlib.sha256(json.dumps(arguments, ensure_ascii=True).encode()).hexdigest()
         with self._locked():
             self._recover()
             if self.settings.sync.enabled:
@@ -361,6 +434,7 @@ class VaultStore:
             previous = self._receipt(request_id, fingerprint)
             if previous is not None:
                 return previous
+            self._check_atomic_device(target.parent)
             if self.settings.commit.mode == "immediate" and self._pending_entries():
                 raise VaultError("PENDING_BATCH", "Flush pending interval writes before switching to immediate mode.")
             old = self._read(target)
@@ -369,8 +443,8 @@ class VaultStore:
             if operation in ("append", "patch") and old is None:
                 raise VaultError("NOT_FOUND", "Create the note with write_note before appending or patching.")
             if operation == "patch":
-                from .editing import apply_patch
-                new = apply_patch(old, content)
+                from .editing import apply_patch_with_spans
+                new, spans = apply_patch_with_spans(old, content)
             else:
                 new = (old or b"") + encoded if operation == "append" else encoded
             if len(new) > self.MAX_BYTES:
@@ -396,6 +470,9 @@ class VaultStore:
             if pending and (pending["ref"] != ref or pending["old_blob"] != old_blob or pending["version"] != version(old)):
                 raise VaultError("DIRTY_TARGET", "The pending note or its Git baseline changed outside VaultWrite.")
             result = {"path": path, "version": version(new), "commit": head, "request_id": request_id, "changed": new != old, "replayed": False}
+            if result_options is not None:
+                from .editing import patch_context
+                result["result_context"] = patch_context(new, spans, result_options["context_before"], result_options["context_after"])
             if self.settings.commit.mode == "interval":
                 result.update({"pending": pending is not None, "commit": None if pending else head})
             if new == old:

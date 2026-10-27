@@ -130,10 +130,10 @@ uv run vault-write-mcp sync-status --vault /tmp/vault-write-ubuntu --config /pat
 | --- | --- | --- |
 | `read_note` | `path` | 返回正文、`exists` 和当前 `version`；不存在时版本为 `missing` |
 | `read_note_range` | `path`, `start_line=1`, `max_lines=80` | 返回带锚点的局部行和整篇版本；最多 200 行、16 KiB |
-| `find_note` | `path`, `text`, `start_line=1`, `max_matches=10` | 在一篇笔记内做区分大小写的字面查找，返回命中行和整篇版本；最多 50 个命中、16 KiB |
+| `find_note` | `path`, `text`, `start_line=1`, `max_matches=10`, `context_before=0`, `context_after=0` | 在一篇笔记内做区分大小写的字面查找，返回命中行和整篇版本；可选返回合并的局部上下文窗口 |
 | `write_note` | `path`, `content`, `expected_version`, `request_id`, `actor` | 创建或整篇替换；版本必须匹配 |
 | `append_note` | 同上 | 在版本检查和同一把锁内读取、拼接、写回；原样追加，不自动补换行 |
-| `patch_note` | `path`, `edits`, `expected_version`, `request_id`, `actor` | 根据行锚点原子替换、删除、插入；所有操作成功才落盘 |
+| `patch_note` | `path`, `edits`, `expected_version`, `request_id`, `actor`, `return_context=false`, `context_before=0`, `context_after=0` | 根据行锚点原子替换、删除、插入；可选返回带新锚点的编辑后局部上下文 |
 | `note_history` | `path`, `limit=20` | 返回修改该笔记的 Git 提交，最多 100 条 |
 | `sync_status` | 无 | 只读同步状态、当前写入提交与待提交数，不触发同步 |
 
@@ -145,7 +145,15 @@ uv run vault-write-mcp sync-status --vault /tmp/vault-write-ubuntu --config /pat
 
 ### 局部读取与锚点修改
 
-优先用 `find_note` 定位关键词，再用 `read_note_range` 读取附近行。两者仅返回局部内容和**整篇**内容版本，不需要把整篇笔记放进模型上下文。`lines`/`matches` 中每项格式为 `行号:12位哈希|正文`；哈希包含该行的换行符。返回 `next_line` 时，使用它作为下一次的 `start_line` 继续读取/查找；`null` 表示本次请求范围内已读完。超出文件尾返回空列表。
+优先用 `find_note` 定位关键词，按需读取附近行。两者仅返回局部内容和**整篇**内容版本，不需要把整篇笔记放进模型上下文。`lines`/`matches` 中每项格式为 `行号:12位哈希|正文`；哈希包含该行的换行符。返回 `next_line` 时，使用它作为下一次的 `start_line` 继续读取/查找；`null` 表示本次请求范围内已读完。超出文件尾返回空列表。
+
+`find_note` 的 `context_before` 和 `context_after` 可选指定每个命中行前后要带回的行数，默认为 `0`，范围为严格整数 `0–50`。非零时除原有 `matches` 外，还返回 `windows`：每个窗口含 `start_line`、`end_line` 和按行号顺序排列的 `lines`；重叠或相邻的窗口会合并，并增加 `context_truncated` 布尔值。匹配项的分页仍只按 `matches` 计算，上下文不会消耗或跳过后续命中。上下文最多返回 200 行；`matches` 与窗口中的渲染行条目（含重复条目）合计受 16 KiB 上限约束。上下文尽力返回；超大上下文行可能被略过并将 `context_truncated` 设为 `true`，而过长的匹配行仍按原有规则返回 `LINE_TOO_LONG`。默认值为零时，响应仍保持原有形状。
+
+例如，下面的查找会带回每个命中行前 1 行、后 3 行的上下文窗口，仍使用原来的 `matches` 锚点及整篇版本：
+
+```json
+{"path":"notes/demo.md","text":"旧标题","context_before":1,"context_after":3}
+```
 
 例如先读取 `{"path":"notes/demo.md","start_line":20,"max_lines":5}`，从返回行 `20:0123456789ab|旧标题` 复制竖线前的锚点，并携带该次返回的真实版本：
 
@@ -158,6 +166,21 @@ uv run vault-write-mcp sync-status --vault /tmp/vault-write-ubuntu --config /pat
   "edits": [
     {"op": "SWAP", "anchor": "20:0123456789ab", "lines": ["新标题"]}
   ]
+}
+```
+
+若要立即继续编辑邻近行，可在第一次补丁中请求编辑后上下文；下面锚点和版本均为占位值。第一次补丁使用刚才读取/查找结果中的锚点与版本；后续补丁再使用本次 `result_context` 中的新锚点和本次返回的 `version`：
+
+```json
+{
+  "path": "notes/demo.md",
+  "edits": [{"op": "SWAP", "anchor": "20:0123456789ab", "lines": ["修订后的标题"]}],
+  "expected_version": "sha256:<读取结果中的完整版本>",
+  "request_id": "<本次操作的唯一编号>",
+  "actor": "codex",
+  "return_context": true,
+  "context_before": 1,
+  "context_after": 3
 }
 ```
 
@@ -174,7 +197,19 @@ uv run vault-write-mcp sync-status --vault /tmp/vault-write-ubuntu --config /pat
 
 新行沿用目标位置的 LF/CRLF；未触及的字节和 UTF-8 BOM 保留，替换及尾部插入保留原文件的末尾换行状态。空文件、仅含 BOM 的文件和不存在的文件没有行锚点，使用 `write_note` 新建内容。单行超过 16 KiB 读取上限时明确返回 `LINE_TOO_LONG`，不截断后生成不完整锚点；这类笔记可使用原有 `read_note`/`write_note`。
 
-补丁仍要求整篇版本完全匹配：其他 agent 即使只改了另一行，旧版本也返回 `VERSION_CONFLICT`。版本相符但锚点不符返回 `ANCHOR_CONFLICT`；重新读取受影响片段并整合后，用新编号重试。成功结果只返回版本、提交/待提交状态等信息，不回传整篇正文；重放、批次提交、原子落盘与 Git 恢复沿用已有事务。
+补丁仍要求整篇版本完全匹配：其他 agent 即使只改了另一行，旧版本也返回 `VERSION_CONFLICT`。版本相符但锚点不符返回 `ANCHOR_CONFLICT`；重新读取受影响片段并整合后，用新编号重试。
+
+需要继续编辑时，可在 `patch_note` 传入 `return_context: true` 和 `context_before`/`context_after`（各为严格整数 `0–50`，默认均为 `0`）；只传非零上下文数值而未启用 `return_context` 会被拒绝。成功响应会增加 `result_context`，包含 `total_lines`、编辑后内容的局部窗口、新锚点和 `truncated` 布尔值；即使前后上下文均为零，也会返回本次编辑后跨度的新锚点（删除整篇笔记时为空窗口）。窗口行号是补丁后的行号。窗口合并、200 行及 16 KiB 限制沿用 `find_note` 的上下文规则。可从新窗口中复制后续目标的锚点，并携带本次返回的 `version` 发起下一次补丁。默认不请求上下文时，响应仍保持原有形状。
+
+带上下文的补丁结果与写入回执一起持久保存。若传输失败，使用完全相同的 `request_id` 和参数重放，服务会返回首次操作时保存的结果及其 `result_context`，不会基于之后的笔记版本重新生成上下文；重放标记为 `replayed: true`。上下文是辅助定位信息，不会放宽整篇版本校验：下一次写入仍须提交当前返回的完整版本，且任何期间的其他写入都会按原样触发版本冲突。
+
+可在本地隔离临时库中复现调用数和返回数据量的对比：
+
+```sh
+uv run python examples/editing_benchmark.py
+```
+
+脚本对相同的两个连续编辑任务比较默认 `find_note`→`read_note_range`→`patch_note` 流程与上下文查找、编辑后锚点复用流程，并验证两者得到相同正文。它统计直接调用 Store 方法的次数及结果字典的紧凑 UTF-8 JSON 字节数，不含建库、验证、MCP/HTTP 封装、模型 token 或费用估算；所有数据只写入自动清理的临时库。
 
 ## 冲突与重试
 
@@ -199,11 +234,12 @@ MCP 工具失败会同时设置 `isError: true` 和 `structuredContent.ok: false
 
 同一 Vault 的所有服务进程使用 `.git/vault-write/write.lock` 的操作系统文件锁。锁覆盖恢复、读取、版本检查、写入、Git ref/index 更新和请求回执。不同文件的写入也会串行完成 Git 事务。
 
-服务使用私有临时 Git index 构建提交，不运行 commit hooks，不依赖机器上的 Git 用户配置。持久化事务日志先于正文写入；正文通过同目录临时文件、`fsync` 和原子替换落盘，Git 分支通过比较旧提交的方式更新。
+服务使用私有临时 Git index 构建提交，不运行 commit hooks，不依赖机器上的 Git 用户配置。持久化事务日志先于正文写入；正文通过与 Vault 同一文件系统上的私有暂存文件、`fsync` 和原子替换落盘，Git 分支通过比较旧提交的方式更新。若笔记目录与 `.git/vault-write` 不在同一文件系统，服务返回 `UNSUPPORTED_FILESYSTEM`，不会退化为非原子复制。
 
 - Git 提交准备失败：笔记保持原样。
 - 更新分支前失败且能安全撤销：恢复旧正文，返回错误，同一个请求可以重试。
 - 进程在事务中退出：下次启动或操作会依据 `pending.json` 完成该事务并保存回执，再接受新操作。未收到成功响应的请求也可能已完成，必须按相同 request_id 重试。
+- 正文原子替换使用 `.git/vault-write/atomic-*.tmp` 私有暂存文件。重启后的启动/操作恢复只清理注册表中名称、设备号与 inode 都匹配的普通单链接文件；未注册的临时文件、已被替换的路径、符号链接或硬链接不会被猜测性删除，需人工检查。旧版可见目录中的 `.vault-write-*.tmp` 也不会自动删除，因为服务无法证明所有权；未知私有临时文件不会进入 Git 提交或同步。该清理不删除 `pending.json` 或请求回执；不要删除未完成的事务日志来强行继续。
 - 事务期间发现分支、正文或目标暂存内容被外部修改：拒绝自动恢复，保留日志和文件供检查。
 - Git 分支已更新，但后续 index 或回执写入仍失败：保留事务并返回 `RECOVERY_REQUIRED`，修复底层错误后重试。
 
