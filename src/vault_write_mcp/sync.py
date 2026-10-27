@@ -73,7 +73,7 @@ def _tree(store, commit):
 
 
 def _clean(store):
-    if store._git("status", "--porcelain=v1", "--untracked-files=all"):
+    if store._git("--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=all"):
         raise VaultError("EXTERNAL_CHANGES", "Commit external edits, staged or untracked files before synchronization.")
 
 

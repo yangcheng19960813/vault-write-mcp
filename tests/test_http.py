@@ -26,11 +26,13 @@ def endpoint(tmp_path, request):
     token = None if mode in ("no-auth", "interval-no-auth") else "integration-test-token"
     log = tmp_path / ".git" / "server-test.log"
     command = [sys.executable, "-m", "vault_write_mcp.server", "serve", "--vault", str(tmp_path), "--port", str(port)]
-    if mode in ("interval", "no-auth", "interval-no-auth", "sync"):
+    if mode in ("interval", "no-auth", "interval-no-auth", "sync", "policy"):
         config = tmp_path / ".git/server-test.toml"
         text = '[auth]\nenabled=false\n' if token is None else ""
         if mode in ("interval", "interval-no-auth"):
             text += '[commit]\nmode="interval"\ninterval_seconds=1\n'
+        if mode == "policy":
+            text += '[write_policy]\ndeny_paths=["protected"]\n'
         if mode == "sync":
             bare = tmp_path / ".git/http-remote.git"
             for args in (("init", "--bare", str(bare)), ("remote", "add", "origin", str(bare)), ("push", "origin", "main"), ("branch", "-m", "ubuntu")):
@@ -241,6 +243,8 @@ async def test_context_schema_new_anchors_and_snapshot_replay_over_real_mcp(endp
             properties = tools[name].inputSchema["properties"]
             assert properties["context_before"]["default"] == 0
             assert properties["context_before"]["minimum"] == 0 and properties["context_before"]["maximum"] == 50
+        compact_schema = tools["find_note"].inputSchema["properties"]["compact"]
+        assert compact_schema["type"] == "boolean" and compact_schema["default"] is False
         assert tools["patch_note"].inputSchema["properties"]["return_context"]["default"] is False
         created = (await session.call_tool("write_note", {
             "path": "note.md", "content": "one\nTARGET\nthree\nfour\n", "expected_version": "missing", "request_id": "seed", "actor": "test",
@@ -250,6 +254,16 @@ async def test_context_schema_new_anchors_and_snapshot_replay_over_real_mcp(endp
         })).structuredContent
         assert found["version"] == created["version"] and not found["context_truncated"]
         assert len(found["windows"]) == 1 and len(found["windows"][0]["lines"]) == 3
+        compact = (await session.call_tool("find_note", {
+            "path": "note.md", "text": "TARGET", "compact": True,
+        })).structuredContent
+        assert compact["matches"] == [{"line": 2, "window_index": 0, "line_index": 0}]
+        assert compact["windows"][0]["lines"] == found["matches"]
+        for bad_compact in (1, 0, "true", None):
+            invalid_compact = await session.call_tool("find_note", {
+                "path": "note.md", "text": "TARGET", "compact": bad_compact,
+            })
+            assert invalid_compact.isError
         arguments = {
             "path": "note.md", "edits": [{"op": "SWAP", "anchor": found["matches"][0].split("|", 1)[0], "lines": ["NEW", "inserted"]}],
             "expected_version": found["version"], "request_id": "context-patch", "actor": "test", "return_context": True, "context_after": 1,
@@ -305,3 +319,17 @@ async def test_preview_move_and_reference_updates_over_real_mcp(endpoint):
         assert replay == {**receipt, "replayed": True}
         conflict = await session.call_tool("move_note", {**arguments, "actor": "different"})
         assert conflict.isError and conflict.structuredContent["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+
+
+@pytest.mark.parametrize("endpoint", ["policy"], indirect=True)
+async def test_http_policy_errors_and_history_opt_in_schema(endpoint):
+    async with client(endpoint) as session:
+        denied = await session.call_tool("write_note", {"path": "protected/note.md", "content": "no", "expected_version": "missing", "request_id": "denied", "actor": "test"})
+        assert denied.isError and not denied.structuredContent["ok"]
+        assert denied.structuredContent["error"]["code"] == "PATH_PROTECTED"
+        read = await session.call_tool("read_note", {"path": "protected/note.md"})
+        assert read.structuredContent["version"] == "missing"
+        history = await session.call_tool("note_history", {"path": "note.md", "follow_renames": True})
+        assert history.structuredContent["ok"] and history.structuredContent["rename_following"] == "git_similarity_heuristic"
+        invalid = await session.call_tool("note_history", {"path": "note.md", "follow_renames": "true"})
+        assert invalid.isError

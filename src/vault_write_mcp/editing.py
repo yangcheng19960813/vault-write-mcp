@@ -158,18 +158,77 @@ def context_windows(lines: list[str], spans: list[tuple[int, int]], before: int,
     return windows, len(selected) != requested_count
 
 
+def compact_find_windows(lines: list[str], hit_indices: list[int], before: int, after: int) -> tuple[list[dict], list[dict], bool]:
+    """Render matched/context lines once and point matches into those windows.
+
+    Hit lines are selected first, so every match which fit the existing match
+    page remains represented even when optional context cannot fit the shared
+    16 KiB/200-line result budget.
+    """
+    if not hit_indices:
+        return [], [], False
+    cores = merge_spans([(index, index + 1) for index in hit_indices])
+    requested = merge_spans([(max(0, start - before), min(len(lines), stop + after))
+                             for start, stop in cores])
+    requested_count = sum(stop - start for start, stop in requested)
+    selected: dict[int, str] = {}
+    remaining = MAX_READ_BYTES
+    for groups in (cores, requested):
+        for start, stop in groups:
+            for index in range(start, stop):
+                if index in selected:
+                    continue
+                if len(selected) >= MAX_CONTEXT_LINES:
+                    break
+                entry = render(index + 1, lines[index])
+                cost = rendered_cost(entry)
+                if cost <= remaining:
+                    selected[index] = entry
+                    remaining -= cost
+            if len(selected) >= MAX_CONTEXT_LINES:
+                break
+
+    windows: list[dict] = []
+    references: dict[int, tuple[int, int]] = {}
+    for index in sorted(selected):
+        if windows and index == windows[-1]["end_line"]:
+            window_index = len(windows) - 1
+            line_index = len(windows[window_index]["lines"])
+            windows[window_index]["end_line"] = index + 1
+            windows[window_index]["lines"].append(selected[index])
+        else:
+            window_index = len(windows)
+            line_index = 0
+            windows.append({"start_line": index + 1, "end_line": index + 1, "lines": [selected[index]]})
+        references[index] = (window_index, line_index)
+
+    # All hits are guaranteed to be present: bounded_lines has already applied
+    # the legacy per-page byte budget to them before this helper is called.
+    matches = [
+        {"line": index + 1, "window_index": references[index][0], "line_index": references[index][1]}
+        for index in hit_indices
+    ]
+    return windows, matches, len(selected) != requested_count
+
+
 def find_lines(data: bytes | None, text: str, start_line: int, max_matches: int,
-               context_before: int = 0, context_after: int = 0) -> dict:
+               context_before: int = 0, context_after: int = 0, compact: bool = False) -> dict:
     positive_int("start_line", start_line)
     positive_int("max_matches", max_matches, 50)
     validate_context(context_before, context_after)
+    if type(compact) is not bool:
+        raise VaultError("INVALID_COMPACT", "compact must be a boolean.")
     if not isinstance(text, str) or not 1 <= len(text) <= 256 or "\n" in text or "\r" in text:
         raise VaultError("INVALID_QUERY", "text must contain 1–256 characters without CR or LF; matching is literal and case-sensitive.")
     _, lines = split_note(data or b"")
     indices = (index for index in range(start_line - 1, len(lines)) if text in lines[index])
     matches, next_line = bounded_lines(lines, indices, max_matches)
     result = {"total_lines": len(lines), "matches": matches, "next_line": next_line}
-    if context_before or context_after:
+    if compact:
+        hits = [int(entry.split(":", 1)[0]) - 1 for entry in matches]
+        windows, match_refs, truncated = compact_find_windows(lines, hits, context_before, context_after)
+        result.update({"matches": match_refs, "windows": windows, "context_truncated": truncated})
+    elif context_before or context_after:
         hits = [int(entry.split(":", 1)[0]) - 1 for entry in matches]
         budget = MAX_READ_BYTES - sum(rendered_cost(entry) for entry in matches)
         windows, truncated = context_windows(lines, [(index, index + 1) for index in hits], context_before, context_after, budget)

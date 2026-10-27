@@ -98,12 +98,27 @@ class AuthConfig:
 
 
 @dataclass(frozen=True)
+class WritePolicyConfig:
+    allow_paths: tuple[str, ...] = ()
+    deny_paths: tuple[str, ...] = ()
+
+    def __post_init__(self):
+        from .policy import normalized_rule
+        for name in ("allow_paths", "deny_paths"):
+            values = getattr(self, name)
+            if not isinstance(values, (list, tuple)) or len(values) > 256:
+                raise ValueError(f"write_policy.{name} must be an array of at most 256 paths.")
+            object.__setattr__(self, name, tuple(sorted({normalized_rule(value) for value in values})))
+
+
+@dataclass(frozen=True)
 class Settings:
     commit: CommitConfig = field(default_factory=CommitConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     push: PushConfig = field(default_factory=PushConfig)
     auth: AuthConfig = field(default_factory=AuthConfig)
     sync: SyncConfig = field(default_factory=SyncConfig)
+    write_policy: WritePolicyConfig = field(default_factory=WritePolicyConfig)
 
     def __post_init__(self):
         if self.sync.enabled and not self.push.enabled:
@@ -115,7 +130,7 @@ def load_settings(path: str | Path | None = None) -> Settings:
         return Settings()
     with Path(path).open("rb") as stream:
         data = tomllib.load(stream)
-    classes = {"commit": CommitConfig, "model": ModelConfig, "push": PushConfig, "auth": AuthConfig, "sync": SyncConfig}
+    classes = {"commit": CommitConfig, "model": ModelConfig, "push": PushConfig, "auth": AuthConfig, "sync": SyncConfig, "write_policy": WritePolicyConfig}
     if set(data) - classes.keys():
         raise ValueError("Unknown configuration section.")
     sections = {}

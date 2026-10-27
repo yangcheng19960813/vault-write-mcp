@@ -25,3 +25,7 @@ branch = ""                    # 空值跟随当前分支；不会 force push
 [sync]
 enabled = false                # 要求 push.enabled=true，独占写入副本
 main_branch = "main"           # 当前分支不能是 main；push.branch 为空或当前写入分支
+
+[write_policy]
+allow_paths = []               # 空表示全部；例 ["notes", "inbox.md"]（路径/目录前缀，不是 glob）
+deny_paths = []                # 例 ["notes/private"]；拒绝优先，NFC+casefold，目录边界匹配

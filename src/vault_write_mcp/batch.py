@@ -1,6 +1,7 @@
 """Deferred file transactions and coordinated batch commits under the vault lock."""
 
 import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -97,6 +98,8 @@ def recover_transaction(store, txn):
 
 def flush(store):
     with store._locked():
+        store._preflight_recovery_policy()
+        store._check_write_paths([entry["path"] for entry in store._pending_entries()])
         store._recover()
         entries = store._pending_entries()
         if not entries:
@@ -160,10 +163,43 @@ def push(store):
         head, ref = store._head(), store._ref()
         branch = config.branch or ref.removeprefix("refs/heads/")
         store._git("check-ref-format", "refs/heads/" + branch)
-        checkpoint = {"head": head, "ref": ref, "remote": config.remote, "branch": branch}
+        # Resolve with the same operator configuration as push (including
+        # pushInsteadOf/insteadOf aliases); fetch URLs are not push identity.
+        # Be conservative: distinct expanded spellings/credentials cause a new
+        # check rather than guessing that SSH/HTTPS destinations are equivalent.
+        try:
+            raw = store._git("remote", "get-url", "--push", "--all", "--", config.remote,
+                             operator_config=True).decode("utf-8")
+            # get-url has newline-delimited output, so independently count the
+            # NUL-delimited configured entries. Reject embedded controls rather
+            # than confusing one unusual URL with multiple destinations.
+            configured = store._git("config", "--null", "--get-all", "remote." + config.remote + ".pushurl",
+                                    allowed_codes=(0, 1), operator_config=True)
+            if not configured:
+                configured = store._git("config", "--null", "--get-all", "remote." + config.remote + ".url",
+                                        operator_config=True)
+            originals = configured.removesuffix(b"\0").split(b"\0")
+            urls = raw.removesuffix("\n").split("\n")
+            if (not raw.endswith("\n") or len(urls) != len(originals)
+                    or any(any(c < 32 or c == 127 for c in item) for item in originals)
+                    or not urls or any(not url or any(ord(c) < 32 or ord(c) == 127 for c in url) for url in urls)):
+                raise ValueError("Invalid push destinations")
+        except (VaultError, UnicodeError, ValueError):
+            raise VaultError("GIT_ERROR", "Cannot resolve configured push destinations; check Git remote configuration.") from None
+        destinations = hashlib.sha256(json.dumps(sorted(set(urls)), ensure_ascii=True).encode()).hexdigest()
+        checkpoint = {"head": head, "ref": ref, "remote": config.remote, "branch": branch,
+                      "destination_digest": destinations}
         path = store.state / "push.json"
-        if path.exists() and json.loads(path.read_text()) == checkpoint:
+        try:
+            previous = json.loads(path.read_text()) if path.exists() else None
+        except (ValueError, UnicodeError):
+            previous = None
+        if previous == checkpoint:
             return {"pushed": False, "commit": head}
-        store._git("push", "--porcelain", "--", config.remote, head + ":refs/heads/" + branch)
+        try:
+            store._git("push", "--porcelain", "--", config.remote, head + ":refs/heads/" + branch)
+        except VaultError:
+            # Git stderr can contain credentials, URLs or remote-provided text.
+            raise VaultError("GIT_ERROR", "Push failed; check Git authentication, destination and branch divergence, then retry.") from None
         store._atomic_write(path, json.dumps(checkpoint).encode())
         return {"pushed": True, "commit": head}

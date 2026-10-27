@@ -88,6 +88,7 @@ def _attributes(store, names):
 def _plan(store, source, destination):
     from .links import rewrite_note_links
     src, dst = _move_path(store, source), _move_path(store, destination)
+    store._check_write_paths([source, destination])
     if source == destination or _canonical(source) == _canonical(destination):
         raise VaultError("PATH_COLLISION", "Source and destination must be distinct, including case and Unicode normalization.")
     if store.settings.sync.enabled:
@@ -147,6 +148,7 @@ def _plan(store, source, destination):
         entries.append({"path": name, "old": notes[name], "new": new, "file_mode": modes[name], "git_mode": tree[name][0]})
     if len(entries) > MAX_AFFECTED_FILES:
         raise VaultError("MOVE_TOO_LARGE", f"Moves change at most {MAX_AFFECTED_FILES} paths.")
+    store._check_write_paths([entry["path"] for entry in entries])
     for entry in entries:
         if entry["new"] is not None:
             store._check_atomic_device(store._path(entry["path"]).parent)
@@ -164,6 +166,9 @@ def _plan(store, source, destination):
 
 def preview_move_note(store, source, destination):
     with store._locked():
+        store._check_write_paths([source, destination])
+        if (store.settings.write_policy.allow_paths or store.settings.write_policy.deny_paths) and not store.journal.exists():
+            _plan(store, source, destination)  # Read-only full policy preflight before cleanup.
         store._recover()
         return _plan(store, source, destination)["public"]
 
@@ -282,9 +287,19 @@ def move_note(store, source, destination, expected_versions, plan_version, reque
     arguments = ["move", source, destination, expected_versions, plan_version, actor]
     fingerprint = hashlib.sha256(json.dumps(arguments, ensure_ascii=True, sort_keys=True).encode()).hexdigest()
     with store._locked():
+        store._check_write_paths([source, destination])
+        # Also guard all caller-supplied paths before recovery. A completed
+        # receipt has its own authoritative affected set, checked below.
+        store._check_write_paths(expected_versions)
+        previous = store._receipt(request_id, fingerprint)
+        if previous is not None:
+            store._check_write_paths(previous["affected_paths"])
+        elif (store.settings.write_policy.allow_paths or store.settings.write_policy.deny_paths) and not store.journal.exists():
+            _plan(store, source, destination)  # Guard omitted backlink paths before cleanup.
         store._recover()
         previous = store._receipt(request_id, fingerprint)
         if previous is not None:
+            store._check_write_paths(previous["affected_paths"])
             return previous
         plan = _plan(store, source, destination)
         if expected_versions != plan["public"]["expected_versions"]:
