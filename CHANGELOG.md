@@ -115,6 +115,15 @@
 - **验证：** 同一组 10 项真实 marker 回归在原实现上全部失败（clean/process 8 项、promisor transport 2 项，均覆盖直接/CLI）；修复后的 11 项新增回归全部通过。使用原锁定依赖和隔离环境执行完整 `python -m pytest -q`：Linux/Python 3.11.17 **524 通过**（158.36 秒），3.13.5 **524 通过**（163.71 秒）；独立全套分别 **524 通过**（156.76 / 160.24 秒）。独立审查及每版本额外 10 项真实 helper/完整 bytes、mode、mtime 快照探针通过，包含 fsmonitor/hooks/extdiff/textconv/alias 与缺失 promisor HEAD/tree。
 - **示例/限制：** `doctor_demo.py` 本地与独立检查均在两个 Python 版本通过；本地 Python 3.11 其余三个 benchmark/move 示例、Python 3.13 `compileall`、`git diff --check` 通过。所有探针仅使用临时 Vault 与本地合成 helper，无真实网络、模型、生产 Vault 或部署；macOS/远端 CI 尚未运行本修复，发布后核实。
 
+### 调查｜历史同步竞态异常与测试诊断缺口
+
+- **结论：** 原始失败 `d5be8f32f9dc09d9096e662db9d5f64bf287fce9` 的 `advanced[0]` 越界只表明竞态注入未完成；底层同步错误仍未确认。旧日志未保留原异常或临时现场，不以重复通过声称竞态已修复。
+- **复现范围：** Ubuntu 隔离环境中，Python 3.14.4/Git 2.53.0 定向循环 100 次；Python 3.13.16/Git 2.55.0 下原测试与当前测试各 100 次，均未复现。匹配工具版本的原始提交完整套件 **513 通过**（169.33 秒）。已核对 store/sync 等 10 个相关运行时模块与当前 main 的 Git blob 完全一致；本机 Ubuntu 26.04 不等于原 CI Ubuntu 24.04 镜像。
+- **修改：** 仅在该合成测试内包装 `sync._save`，捕获它正在处理的 `VaultError/OSError` 及调用栈；断言消息改用多行字符串，避免 pytest 截断嵌套字典。保留原拒绝/重试/数据断言，未增加生产重试或修改运行时。
+- **隐私与兼容：** 原始异常只来自隔离夹具，禁用该用例的 global Git 配置，不记录 locals/环境；服务错误脱敏、持久状态和接口不变。无依赖变更。
+- **诊断验证：** 改动前真实 fetch 失败的 pytest 输出缺少底层原因且字典被截断；改动后删除合成本地 remote/main 的正对照按预期失败，日志完整保留 `fetch_main`、`GIT_ERROR`、缺失 ref 的原 stderr 与栈；临时 bare 清理 `OSError` 正对照亦按预期失败并保留 `STORAGE_ERROR`/原异常栈。正常竞态用例通过。两项故障注入只证明诊断有效，不是历史根因复现。
+- **回归/交付：** 锁定依赖、Python 3.13.16/Git 2.55.0 下 `python -m pytest -q` 全套 **524 通过**（202.24 秒），独立只读复审通过。本次只改测试与记录，未提交、推送或部署；正式服务保持原有发布。
+
 ## 追加模板
 
 ```markdown

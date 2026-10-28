@@ -5,10 +5,13 @@ import json
 import multiprocessing
 import os
 import subprocess
+import sys
 import threading
+import traceback
 
 import pytest
 
+from vault_write_mcp import sync as sync_module
 from vault_write_mcp.config import CommitConfig, PushConfig, Settings, SyncConfig
 from vault_write_mcp.store import VaultError, VaultStore, init_vault
 
@@ -172,9 +175,27 @@ def test_recovery_protects_external_modification(pair):
 
 def test_push_main_race_retries_without_loss(pair, monkeypatch):
     remote, main, writer = pair
+    # Raw exceptions below belong only to this isolated, synthetic fixture.
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
     writer_commit = write(writer, "agent.md", "agent", "agent")["commit"]
     original = writer._git
     advanced, hook_events, fixture_errors = [], [], []
+    original_save, sync_exceptions = sync_module._save, []
+
+    def observed_save(store, result):
+        exc = sys.exception()
+        if store is writer and isinstance(exc, (VaultError, OSError)):
+            sync_exceptions.append("".join(traceback.format_exception(exc)))
+        return original_save(store, result)
+
+    def diagnostic(result):
+        # A string keeps pytest from truncating a nested diagnostic dictionary.
+        return "\n".join(sync_exceptions + [
+            f"sync: {result!r}", f"hook_events: {hook_events!r}",
+            f"fixture_errors: {fixture_errors!r}",
+        ])
+
+    monkeypatch.setattr(sync_module, "_save", observed_save)
     def race(*args, **kwargs):
         if args[0] == "push" and args[-1].endswith(":refs/heads/main") and not advanced:
             hook_events.append("entered")
@@ -197,19 +218,18 @@ def test_push_main_race_retries_without_loss(pair, monkeypatch):
         return original(*args, **kwargs)
     monkeypatch.setattr(writer, "_git", race)
     result = writer.sync()
-    diagnostic = {"sync": result, "hook_events": hook_events, "fixture_errors": fixture_errors}
-    assert result["state"] == "error", diagnostic
-    assert result["stage"] == "push_main", diagnostic
-    assert result["error_code"] == "GIT_ERROR", diagnostic
-    assert hook_events == ["entered", "main_write_started", "main_written", "main_published"], diagnostic
-    assert len(advanced) == 1, diagnostic
-    assert not result["published"] and not result["applied"], diagnostic
+    assert result["state"] == "error", diagnostic(result)
+    assert result["stage"] == "push_main", diagnostic(result)
+    assert result["error_code"] == "GIT_ERROR", diagnostic(result)
+    assert hook_events == ["entered", "main_write_started", "main_written", "main_published"], diagnostic(result)
+    assert len(advanced) == 1, diagnostic(result)
+    assert not result["published"] and not result["applied"], diagnostic(result)
     assert writer._head() == writer_commit
     assert git(remote, "rev-parse", "main") == advanced[0]
     assert git(remote, "rev-parse", "ubuntu") == writer_commit
     retry = writer.sync()
-    assert retry["state"] == "synced", retry
-    assert retry["published"] and retry["applied"], retry
+    assert retry["state"] == "synced", diagnostic(retry)
+    assert retry["published"] and retry["applied"], diagnostic(retry)
     assert writer.read_note("race.md")["content"] == "race"
     assert writer.read_note("agent.md")["content"] == "agent"
 
