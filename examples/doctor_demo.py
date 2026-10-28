@@ -21,9 +21,14 @@ def main():
         store.write_note("before.md", "# Synthetic example\n", "missing", "seed", "demo")
         plan = store.preview_move_note("before.md", "after.md")
         store.move_note("before.md", "after.md", plan["expected_versions"], plan["plan_version"], "move", "demo")
+        # doctor intentionally does not inspect worktree/index cleanliness:
+        # even with an external edit, tracked_changes is unknown, not changed.
+        with (root / "after.md").open("ab") as stream:
+            stream.write(b"Uncommitted synthetic external edit\n")
         before = snapshot(root)
         result = doctor(root)
         assert snapshot(root) == before, "Diagnostic changed vault files"
+        assert result["vault"]["tracked_changes"] == "unknown"
         print(json.dumps({"doctor": result, "history": store.note_history("after.md", follow_renames=True)}, ensure_ascii=False, indent=2))
 
 

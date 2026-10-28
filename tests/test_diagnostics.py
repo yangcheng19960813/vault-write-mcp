@@ -3,6 +3,7 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -10,6 +11,7 @@ import sys
 import pytest
 
 from vault_write_mcp.config import Settings, WritePolicyConfig
+from vault_write_mcp import diagnostics
 from vault_write_mcp.diagnostics import doctor
 from vault_write_mcp.store import VaultError, VaultStore, init_vault
 
@@ -42,6 +44,113 @@ def test_doctor_does_not_initialize_state_or_construct_store(root, monkeypatch):
     result = assert_read_only(root)
     assert result["read_only"] and result["journal"]["status"] == "absent"
     assert not (root / ".git/vault-write").exists()
+
+
+@pytest.mark.parametrize("entrypoint", ["direct", "cli"])
+@pytest.mark.parametrize("filter_kind", ["clean", "process"])
+@pytest.mark.parametrize("same_size_edit", [False, True], ids=["racy_unchanged", "racy_edited"])
+def test_doctor_never_executes_real_content_filter(root, entrypoint, filter_kind, same_size_edit):
+    """Racy index stats can make even diff-files --quiet run clean filters."""
+    def git(*args, check=True):
+        return subprocess.run(["git", "-C", str(root), *args], check=check, capture_output=True)
+
+    note = root / "note.md"
+    note.write_bytes(b"before\n")
+    git("add", "note.md")
+    git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "synthetic filter fixture")
+    # The marker and executable are deliberately outside the vault: a snapshot
+    # of the vault alone cannot detect arbitrary filter side effects.
+    marker = root.parent / (root.name + "-filter-executed")
+    script = root.parent / (root.name + "-filter.py")
+    script.write_text("from pathlib import Path\nimport sys\n"
+                      f"Path({str(marker)!r}).write_text('executed')\n"
+                      + ("sys.stdout.buffer.write(sys.stdin.buffer.read())\n" if filter_kind == "clean" else "sys.exit(1)\n"))
+    git("config", "filter.doctor-test." + filter_kind, shlex.join([sys.executable, str(script)]))
+    git("config", "filter.doctor-test.required", "true")
+    git("config", "core.trustctime", "false")
+    (root / ".git/info/attributes").write_text("note.md filter=doctor-test\n")
+    # Positive control proves this is a real active Git filter, not a mocked
+    # subprocess. Do not write Git objects, and clear only our synthetic marker.
+    # The process variant exits rather than implementing the filter protocol;
+    # launching it is already the forbidden side effect we are guarding.
+    control = git("hash-object", "--path=note.md", "note.md", check=False)
+    assert (control.returncode == 0) == (filter_kind == "clean")
+    assert marker.read_text() == "executed"
+    marker.unlink()
+    note_stat = note.stat()
+    if same_size_edit:
+        note.write_bytes(b"after!\n")
+        os.utime(note, ns=(note_stat.st_atime_ns, note_stat.st_mtime_ns))
+    # Deterministic racy-clean entry on both nanosecond and second-resolution
+    # Git builds: recorded note mtime is later than the index file's timestamp.
+    index = root / ".git/index"
+    os.utime(index, ns=(index.stat().st_atime_ns, note_stat.st_mtime_ns - 2_000_000_000))
+
+    def inspect(root):
+        if entrypoint == "direct":
+            return doctor(root)
+        completed = subprocess.run([sys.executable, "-m", "vault_write_mcp.server", "doctor", "--vault", str(root)],
+                                   check=True, capture_output=True, text=True)
+        return json.loads(completed.stdout)
+
+    result = assert_read_only(root, inspect)
+    assert not marker.exists(), "doctor executed the repository's content filter"
+    assert result["read_only"] and result["vault"]["tracked_changes"] == "unknown"
+
+
+def test_doctor_runs_only_ref_and_root_git_commands(root, monkeypatch):
+    run = subprocess.run
+    commands = []
+    def metadata_only(command, **kwargs):
+        suffix = command[command.index("--literal-pathspecs") + 1:]
+        assert suffix in (["rev-parse", "--show-toplevel"], ["rev-parse", "--verify", "HEAD"], ["symbolic-ref", "-q", "HEAD"])
+        assert kwargs["env"]["GIT_NO_LAZY_FETCH"] == "1"
+        assert kwargs["env"]["GIT_NO_REPLACE_OBJECTS"] == "1"
+        commands.append(suffix)
+        return run(command, **kwargs)
+    monkeypatch.setattr(diagnostics.subprocess, "run", metadata_only)
+    result = assert_read_only(root)
+    assert len(commands) == 3 and result["vault"]["tracked_changes"] == "unknown"
+
+
+@pytest.mark.parametrize("entrypoint", ["direct", "cli"])
+def test_doctor_missing_promisor_tree_never_starts_transport(root, entrypoint):
+    """No network: the synthetic ext transport only writes an external marker."""
+    def git(*args, check=True):
+        return subprocess.run(["git", "-C", str(root), *args], check=check, capture_output=True)
+
+    (root / "note.md").write_bytes(b"synthetic promisor fixture\n")
+    git("add", "note.md")
+    git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "synthetic promisor fixture")
+    head = git("rev-parse", "HEAD").stdout.decode().strip()
+    tree = git("rev-parse", "HEAD^{tree}").stdout.decode().strip()
+    marker = root.parent / (root.name + "-transport-executed")
+    helper = root / ".git/marker-transport.sh"
+    helper.write_text("#!/bin/sh\nprintf executed > " + shlex.quote(str(marker)) + "\nexit 1\n")
+    helper.chmod(0o700)
+    # remote-ext uses percent escaping, not shell quoting, for its argv.
+    command = str(helper).replace("%", "%%").replace(" ", "% ")
+    git("config", "remote.origin.url", "ext::" + command)
+    git("config", "remote.origin.promisor", "true")
+    git("config", "remote.origin.partialclonefilter", "blob:none")
+    git("config", "protocol.ext.allow", "always")
+    (root / ".git/objects" / tree[:2] / tree[2:]).unlink()
+    # Positive control proves that object reads launch our benign transport.
+    assert git("cat-file", "-p", tree, check=False).returncode != 0
+    assert marker.read_text() == "executed"
+    marker.unlink()
+
+    def inspect(root):
+        if entrypoint == "direct":
+            return doctor(root)
+        completed = subprocess.run([sys.executable, "-m", "vault_write_mcp.server", "doctor", "--vault", str(root)],
+                                   check=True, capture_output=True, text=True)
+        return json.loads(completed.stdout)
+
+    result = assert_read_only(root, inspect)
+    assert not marker.exists(), "doctor launched a promisor transport"
+    assert result["vault"]["head"] == head  # A ref ID, not proof its objects exist.
+    assert result["vault"]["tracked_changes"] == "unknown"
 
 
 def test_doctor_existing_store_has_read_only_advisory_counts(root):

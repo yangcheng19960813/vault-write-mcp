@@ -352,9 +352,9 @@ git -C /tmp/vault-write-demo show <commit>:notes/example.md
 uv run vault-write-mcp doctor --vault /path/to/vault --config config.toml
 ```
 
-`doctor` 不需要 MCP 令牌，不构造 `VaultStore`，不触发初始化/恢复、清理原子临时文件、创建目录/锁、写 SQLite 或刷新 Git index；不联网。输出为有界 JSON：正规 Git 状态、有效 HEAD、日志种类/受影响数量、HEAD/ref 是否符合日志、当前策略是否阻塞，以及人工下一步。仅输出固定标签、数量和已校验对象 ID，不回显日志任意字段、正文、凭据、URL、路径或 Git 错误；因此**不定位具体冲突文件**，也不证明日志/正文/index 可安全恢复。损坏、过大、symlink/FIFO 状态会给出不可安全检查的标签，不自动删除或修改任何现场。
+`doctor` 不需要 MCP 令牌，不构造 `VaultStore`，不触发初始化/恢复、清理原子临时文件、创建目录/锁、写 SQLite 或刷新 Git index；不联网。输出为有界 JSON：普通 Git 仓库识别、仅校验格式的 HEAD 引用 ID、日志种类/受影响数量、HEAD/ref 是否符合日志、当前策略是否阻塞，以及人工下一步。HEAD ID 不证明对应对象存在、完整或属于有效提交。仅输出固定标签、数量和格式已校验的对象 ID，不回显日志任意字段、正文、凭据、URL、路径或 Git 错误；因此**不定位具体冲突文件**，也不证明日志/正文/index 可安全恢复。损坏、过大、symlink/FIFO 状态会给出不可安全检查的标签，不自动删除或修改任何现场。
 
-这是无需锁的实时尽力快照；并发写入可能让观察不一致，必要时先停写再诊断。Git plumbing 不刷新 stat 缓存，`tracked_changes=changed_or_stat_stale` 也可能只是缓存过旧，且不检查未跟踪文件。SQLite 使用只读 immutable 主数据库快照，不创建 WAL/SHM；存在 WAL、SHM 或 rollback journal 任一 SQLite 旁文件时 `observation_complete=false`，主数据库快照可能不完整/包含未提交页，计数不能代表最终事务状态；旁文件无法安全检查时标记 `null`（未知）且观察不完整，不得视为无待处理事务。诊断有输入上限（日志 64 MiB、数据库 128 MiB、路径 2,000、计数 100,000 后标记封顶），不会保证读取访问时间 atime 不变；这些是输入/输出界限，不是严格进程内存/RSS 上限，JSON 解析仍可能有内存放大，不承诺抵御恶意资源耗尽。`no_journal` 仅表示本次未观察到日志，不等于健康、已提交或已发布。
+这是无需锁的实时尽力快照；并发写入可能让观察不一致，必要时先停写再诊断。Git 仅执行根目录与引用元数据查询，**不检查工作区、暂存区或未跟踪文件，`tracked_changes` 始终为 `unknown`**，不能将其视为干净或有变化。即使 `diff-files --quiet --no-ext-diff --no-textconv` 也可能为 racy-clean index 执行 clean/process 内容过滤器；禁用可选锁并不能阻止它们。doctor 因此完全不运行 diff/status 或读取 Git 对象，并防御性禁止 lazy fetch，避免缺失 promisor 对象触发 transport。SQLite 使用只读 immutable 主数据库快照，不创建 WAL/SHM；存在 WAL、SHM 或 rollback journal 任一 SQLite 旁文件时 `observation_complete=false`，主数据库快照可能不完整/包含未提交页，计数不能代表最终事务状态；旁文件无法安全检查时标记 `null`（未知）且观察不完整，不得视为无待处理事务。诊断有输入上限（日志 64 MiB、数据库 128 MiB、路径 2,000、计数 100,000 后标记封顶），不会保证读取访问时间 atime 不变；这些是输入/输出界限，不是严格进程内存/RSS 上限，JSON 解析仍可能有内存放大，不承诺抵御恶意资源耗尽。`no_journal` 仅表示本次未观察到日志，不等于健康、已提交或已发布。
 
 先停止服务和外部写入者、完整备份 Vault 与 `.git`，保留 `pending.json`/回执/未知临时文件。若 `policy_blocked`，由操作者恢复允许原事务的策略；若有外部冲突，人工检查并保留现场，不自动选 ours/theirs/reset。恢复仍由正常初始化执行既有完整校验；准备好后用原配置重启，并以完全相同参数和 request_id 重试。
 

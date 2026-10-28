@@ -62,11 +62,13 @@ def _directory(path):
 
 def _git(root, *args):
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-    env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+    env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+               GIT_NO_LAZY_FETCH="1", GIT_NO_REPLACE_OBJECTS="1")
     try:
         result = subprocess.run(["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
                                  "--literal-pathspecs", *args], cwd=root, env=env, capture_output=True, timeout=5)
-        # Commands below return only an object ID/ref/root or one bool exit code.
+        # Metadata commands only: never inspect worktree content or read objects
+        # that might require a promisor fetch. Optional locks do not stop filters.
         return (result.returncode, result.stdout[:8192])
     except (OSError, subprocess.TimeoutExpired):
         return (-1, b"")
@@ -154,11 +156,11 @@ def doctor(root, settings=None):
     head = head if head_code == 0 and OID.fullmatch(head) else None
     ref_code, raw_ref = _git(root, "symbolic-ref", "-q", "HEAD")
     ref = raw_ref.decode("utf-8", errors="replace").strip() if ref_code == 0 else None
-    # diff --quiet avoids unbounded path/content output and optional index writes.
-    working, _ = _git(root, "diff-files", "--quiet", "--no-ext-diff", "--no-textconv", "--ignore-submodules")
-    staged, _ = _git(root, "diff-index", "--cached", "--quiet", "--no-ext-diff", "--no-textconv", "--ignore-submodules", "HEAD")
+    # Even diff-files --quiet can hash a racy-clean entry and execute arbitrary
+    # clean/process filters. Do not inspect the worktree or index at all: unknown
+    # is intentional, not evidence of a clean vault or safe recovery.
     result["vault"] = {"status": "regular_git", "head": head, "named_branch": ref is not None,
-                       "tracked_changes": "clean" if working == staged == 0 else "changed_or_stat_stale" if working == 1 or staged == 1 else "unknown"}
+                       "tracked_changes": "unknown"}
     state = root / ".git/vault-write"
     if _presence(state) is False:
         result.update(journal={"status": "absent"}, receipts={"status": "absent"})

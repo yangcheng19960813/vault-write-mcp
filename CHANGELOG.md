@@ -104,6 +104,17 @@
 - **修改内容：** 仅强化测试诊断，保留并检查 sync stage/error、钩子阶段和合成夹具异常；增加未发布/未应用、writer/远端分支、重试后双方正文保留断言。不删除或放宽原竞态拒绝/重试/不丢历史的断言，未作推测性生产代码改动。
 - **验证：** 改动前 Git 2.52.0/Python 3.13.5 的 200 次独立合成复现均通过；另以 Python 3.13.16/Git 2.52.0 运行 50 次复现全部通过，强化后的 sync 全套 43 项通过；本地已在 `/tmp` 从官方源码构建 Git 2.55.0（无 Rust/HTTP 扩展），匹配版本探针进行中。后续 CI 结果另行追加。
 
+## 2026-10-28
+
+### 修复｜doctor 不再触发 Git 内容过滤器或 promisor transport
+
+- **状态：** PR #4 修复已通过 Linux 本地双版本及独立验收，待远端 Linux/macOS 矩阵验证；未合并、未部署。
+- **问题证据：** 在实际 PR 提交 `8d1e7fd811cce3d80f9b89127561ab8fbe93f6b4` 的隔离临时 Vault 中，racy-clean index 会令 `diff-files --quiet` 执行 clean 内容过滤器，创建 Vault 之外的合成 marker，即使目录快照不变且结果声称 `read_only=true`。独立检查也发现缺失 promisor tree 的 `diff-index` 可启动 transport；旧 513 项套件未覆盖这两类副作用。
+- **修改内容：** 完全移除 doctor 的 `diff-files`/`diff-index`，Git 仅查询根目录、HEAD/ref 元数据，防御性禁用 lazy fetch 与 replace object；不尝试逐项覆盖不可信过滤器配置。增加真实 clean/process 可执行 marker、缺失 promisor tree 的本地无网络 transport marker，以及 Git 查询范围回归。
+- **兼容/安全：** 保留结果形状，`tracked_changes` 有意始终为 `unknown`，不再提供工作区/暂存区干净与否判断；HEAD 仅是格式已校验的引用 ID，不验证对象存在/完整性。README 与临时库演示同步说明此边界。其余四项功能、依赖和配置默认值不变；原始 CI 同步竞态偶发异常的根因仍未知，本修复不声称解决该异常。
+- **验证：** 同一组 10 项真实 marker 回归在原实现上全部失败（clean/process 8 项、promisor transport 2 项，均覆盖直接/CLI）；修复后的 11 项新增回归全部通过。使用原锁定依赖和隔离环境执行完整 `python -m pytest -q`：Linux/Python 3.11.17 **524 通过**（158.36 秒），3.13.5 **524 通过**（163.71 秒）；独立全套分别 **524 通过**（156.76 / 160.24 秒）。独立审查及每版本额外 10 项真实 helper/完整 bytes、mode、mtime 快照探针通过，包含 fsmonitor/hooks/extdiff/textconv/alias 与缺失 promisor HEAD/tree。
+- **示例/限制：** `doctor_demo.py` 本地与独立检查均在两个 Python 版本通过；本地 Python 3.11 其余三个 benchmark/move 示例、Python 3.13 `compileall`、`git diff --check` 通过。所有探针仅使用临时 Vault 与本地合成 helper，无真实网络、模型、生产 Vault 或部署；macOS/远端 CI 尚未运行本修复，发布后核实。
+
 ## 追加模板
 
 ```markdown
