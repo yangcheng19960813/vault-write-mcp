@@ -75,6 +75,20 @@ uv run vault-write-mcp serve --vault /path/to/test-vault --config /path/to/vault
 
 模型接口采用 [Chat Completions 格式](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)：只发送本次提交涉及的 diff，不发送整个知识库；每次有变化的提交尝试至多发一次 HTTP 请求，没有工具调用和自动 HTTP 重试。OpenAI 已将 `max_tokens` 标为弃用，默认使用 `max_completion_tokens`；其他兼容提供商按其支持情况配置。HTTP 重定向不会携带凭据继续访问。
 
+### 可选写入路径保护
+
+默认 `[write_policy] allow_paths=[] / deny_paths=[]` 不增加限制。显式配置后同时保护 `write_note`、`append_note`、`patch_note`、移动预览与执行（源、目标和所有改写引用笔记），以及已有 interval 批次的 flush。例：
+
+```toml
+[write_policy]
+allow_paths = ["notes", "inbox.md"]
+deny_paths = ["notes/private"]
+```
+
+规则为相对可见 POSIX 路径，匹配自身或以 `/` 分隔的后代，不是 glob；`notes` 不匹配 `notes-other`。可有一个尾部 `/`，拒绝空段、点段、反斜杠、控制符和 glob 字符；每组最多 256 条、每条最多 1,024 字符。比较使用 Unicode NFC 与 casefold（保守覆盖 macOS 大小写/Unicode 文件系统别名），但不改实际文件名。空 allow 表示全部，deny 始终优先。拒绝返回 `PATH_PROTECTED`，完整受影响集合预检后才可修改正文、ref、index、回执或日志；读取不受限。`actor` 不是认证身份，不能绕过规则。
+
+**重试/恢复：** 当前策略也检查已完成回执的重放；新策略拒绝时保留原回执，不重新执行或生成结果，恢复允许策略后可原样重放。未完成事务的全部受影响路径在初始化创建 schema/锁和恢复清理之前检查；策略变严则整次阻塞，保留现场，先运行只读诊断并由操作者恢复允许策略后再启动恢复。已有 interval 待提交笔记变为受保护也会阻塞 flush。不要删除日志/数据库绕过策略。规则只约束上述服务写入入口，不是操作系统权限或外部 Git/文件编辑限制，也**不阻断显式启用的双分支同步 checkout**；如需保护文件不被远端同步修改，应停用 sync 或在服务之外配置访问边界。
+
 ### 定时模式的确认与恢复
 
 将 `commit.mode` 设为 `interval`，可在一个周期内将多次修改汇总成一条提交。没有待提交变化或内容最终恢复原样时，不调用模型，也不创建空提交。若选择 `immediate` 并启用模型，每次有效写入都会调用一次模型。
@@ -97,7 +111,7 @@ uv run vault-write-mcp flush --vault /path/to/test-vault --config /path/to/vault
 未启用 sync 时，服务只做普通 push，不 force、不 pull，不自动解决远端分歧。先在测试 Vault 配好 remote 与 Git 认证；首次推送当前 HEAD 及历史，之后仅 HEAD 或目标变化时推送。检查周期复用 commit.interval_seconds。
 
 
-成功推送的检查点保存在 `.git/vault-write/push.json`，重启后沿用。推送失败不会撤销本地提交，也不会重新调用模型生成信息；后台在下个周期重试。API Key 不参与 Git 认证。
+成功推送的检查点保存在 `.git/vault-write/push.json`，重启后沿用。检查点包含所有实际 push URL（含 `pushurl` 与操作员 Git URL 别名展开）的排序去重 SHA-256 摘要，不保存 URL/凭据；同名 remote 改址或目标分支改变会重新普通推送。不同 SSH/HTTPS 拼写或凭据不猜测等价，宁可多检查一次；仅 fetch URL 改变而独立 push URL 不变时不会重推。旧格式/损坏检查点会安全重检。含控制符或换行分隔歧义的 URL 会拒绝推送，不猜测目标。Git 推送错误只返回通用说明，不回显远端输出。推送失败不会撤销本地提交，也不会重新调用模型生成信息；后台在下个周期重试。API Key 不参与 Git 认证。
 
 ### 双分支同步（默认关闭）
 
@@ -130,13 +144,13 @@ uv run vault-write-mcp sync-status --vault /tmp/vault-write-ubuntu --config /pat
 | --- | --- | --- |
 | `read_note` | `path` | 返回正文、`exists` 和当前 `version`；不存在时版本为 `missing` |
 | `read_note_range` | `path`, `start_line=1`, `max_lines=80` | 返回带锚点的局部行和整篇版本；最多 200 行、16 KiB |
-| `find_note` | `path`, `text`, `start_line=1`, `max_matches=10`, `context_before=0`, `context_after=0` | 在一篇笔记内做区分大小写的字面查找，返回命中行和整篇版本；可选返回合并的局部上下文窗口 |
+| `find_note` | `path`, `text`, `start_line=1`, `max_matches=10`, `context_before=0`, `context_after=0`, `compact=false` | 在一篇笔记内做区分大小写的字面查找，返回命中行和整篇版本；可选返回合并的局部上下文窗口 |
 | `write_note` | `path`, `content`, `expected_version`, `request_id`, `actor` | 创建或整篇替换；版本必须匹配 |
 | `append_note` | 同上 | 在版本检查和同一把锁内读取、拼接、写回；原样追加，不自动补换行 |
 | `patch_note` | `path`, `edits`, `expected_version`, `request_id`, `actor`, `return_context=false`, `context_before=0`, `context_after=0` | 根据行锚点原子替换、删除、插入；可选返回带新锚点的编辑后局部上下文 |
 | `preview_move_note` | `source`, `destination` | 只读预览移动方案、受影响路径、有限的逐链接目标摘要与版本前置条件 |
 | `move_note` | `source`, `destination`, `expected_versions`, `plan_version`, `request_id`, `actor` | 校验预览后以一个可恢复的多文件事务移动笔记并更新支持的引用；完成后创建一个 Git 提交 |
-| `note_history` | `path`, `limit=20` | 返回修改该笔记的 Git 提交，最多 100 条 |
+| `note_history` | `path`, `limit=20`, `follow_renames=false` | 返回修改该笔记的 Git 提交，最多 100 条；可选 Git 重命名启发式 |
 | `sync_status` | 无 | 只读同步状态、当前写入提交与待提交数，不触发同步 |
 
 现有笔记的版本形如 `sha256:<64 位小写十六进制>`，按原始 UTF-8 字节计算。创建新笔记也必须显式提交 `expected_version: "missing"`；它只能匹配真正不存在的文件。服务不提供 `blind`、强制覆盖或关闭版本校验的参数。BOM、CRLF 和末尾换行会原样保留。
@@ -212,6 +226,21 @@ uv run python examples/editing_benchmark.py
 ```
 
 脚本对相同的两个连续编辑任务比较默认 `find_note`→`read_note_range`→`patch_note` 流程与上下文查找、编辑后锚点复用流程，并验证两者得到相同正文。它统计直接调用 Store 方法的次数及结果字典的紧凑 UTF-8 JSON 字节数，不含建库、验证、MCP/HTTP 封装、模型 token 或费用估算；所有数据只写入自动清理的临时库。
+
+#### 可选紧凑查找上下文
+
+`find_note(..., compact=true)` 将每条原始渲染行（`行号:哈希|原文`）只放在 `windows` 中一次，`matches` 改为 `{"line": 3, "window_index": 0, "line_index": 2}` 引用；两个 index 都从 **0** 开始，`line` 为 **1** 起始行号。定位示例：
+
+```python
+window = result["windows"][match["window_index"]]
+rendered_line = window["lines"][match["line_index"]]
+assert window["start_line"] + match["line_index"] == match["line"]
+anchor, text = rendered_line.split("|", 1)
+```
+
+默认 `compact=false` 的响应形状和内容不变。紧凑模式即使 before/after 都为 0 也返回只包含命中行的窗口；无命中则空窗口。每页匹配、`next_line`、整篇版本及锚点与默认模式一致，不跳过命中、不做有损摘要。先保证本页命中行，再加入可容纳的上下文，合并相邻/重叠窗口；原样保留可见原文和换行敏感锚点，仍限制 200 行与 16 KiB 渲染行预算（JSON 元数据/传输封装不计入这个既有上限）。超预算邻行可省略并设 `context_truncated=true`；单条命中超过上限仍为 `LINE_TOO_LONG`。
+
+`uv run python examples/compact_find_benchmark.py` 自建固定合成临时 Vault，通过 in-process ASGI HTTP transport 计量序列化结果 JSON 和 MCP 实际响应 body 字节；不含 HTTP 头/分块/TCP/TLS 开销，也不是模型 token。该样本默认/紧凑 JSON 为 **4,849 / 2,647 字节**，MCP response body 为 **9,871 / 5,485 字节**；小行或无上下文时元数据可使紧凑模式更大，不保证所有输入都节省。
 
 ### 安全移动笔记并更新引用
 
@@ -316,6 +345,20 @@ git -C /tmp/vault-write-demo show <commit>:notes/example.md
 ```
 
 要恢复旧内容，取出历史正文，再读取当前版本并通过 `write_note` 写回，形成新的历史记录。
+
+### 只读恢复诊断与可选历史关联
+
+```sh
+uv run vault-write-mcp doctor --vault /path/to/vault --config config.toml
+```
+
+`doctor` 不需要 MCP 令牌，不构造 `VaultStore`，不触发初始化/恢复、清理原子临时文件、创建目录/锁、写 SQLite 或刷新 Git index；不联网。输出为有界 JSON：普通 Git 仓库识别、仅校验格式的 HEAD 引用 ID、日志种类/受影响数量、HEAD/ref 是否符合日志、当前策略是否阻塞，以及人工下一步。HEAD ID 不证明对应对象存在、完整或属于有效提交。仅输出固定标签、数量和格式已校验的对象 ID，不回显日志任意字段、正文、凭据、URL、路径或 Git 错误；因此**不定位具体冲突文件**，也不证明日志/正文/index 可安全恢复。损坏、过大、symlink/FIFO 状态会给出不可安全检查的标签，不自动删除或修改任何现场。
+
+这是无需锁的实时尽力快照；并发写入可能让观察不一致，必要时先停写再诊断。Git 仅执行根目录与引用元数据查询，**不检查工作区、暂存区或未跟踪文件，`tracked_changes` 始终为 `unknown`**，不能将其视为干净或有变化。即使 `diff-files --quiet --no-ext-diff --no-textconv` 也可能为 racy-clean index 执行 clean/process 内容过滤器；禁用可选锁并不能阻止它们。doctor 因此完全不运行 diff/status 或读取 Git 对象，并防御性禁止 lazy fetch，避免缺失 promisor 对象触发 transport。SQLite 使用只读 immutable 主数据库快照，不创建 WAL/SHM；存在 WAL、SHM 或 rollback journal 任一 SQLite 旁文件时 `observation_complete=false`，主数据库快照可能不完整/包含未提交页，计数不能代表最终事务状态；旁文件无法安全检查时标记 `null`（未知）且观察不完整，不得视为无待处理事务。诊断有输入上限（日志 64 MiB、数据库 128 MiB、路径 2,000、计数 100,000 后标记封顶），不会保证读取访问时间 atime 不变；这些是输入/输出界限，不是严格进程内存/RSS 上限，JSON 解析仍可能有内存放大，不承诺抵御恶意资源耗尽。`no_journal` 仅表示本次未观察到日志，不等于健康、已提交或已发布。
+
+先停止服务和外部写入者、完整备份 Vault 与 `.git`，保留 `pending.json`/回执/未知临时文件。若 `policy_blocked`，由操作者恢复允许原事务的策略；若有外部冲突，人工检查并保留现场，不自动选 ours/theirs/reset。恢复仍由正常初始化执行既有完整校验；准备好后用原配置重启，并以完全相同参数和 request_id 重试。
+
+`note_history(..., follow_renames=true)` 可使用 Git `--follow` 追踪当前单一路径以前的名称，结果额外标记 `rename_following=git_similarity_heuristic`。默认响应和行为不变。相似文件、复制、重写或复杂合并可能漏关联或误关联；这不是笔记身份或来源的证明，不用于授权、版本校验或恢复决策。演示：`uv run python examples/doctor_demo.py`（自建临时 Vault）。
 
 ## 当前边界
 

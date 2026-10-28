@@ -63,9 +63,12 @@ class VaultStore:
         self.state = git_dir / "vault-write"
         if self.state.is_symlink():
             raise VaultError("INVALID_VAULT", "The state directory must not be a symlink.")
-        self.state.mkdir(mode=0o700, exist_ok=True)
         self.journal = self.state / "pending.json"
         self.database = self.state / "receipts.sqlite3"
+        # A stricter policy must stop an old journal before schema/lock creation
+        # or atomic-file cleanup, not after partially completing recovery.
+        self._preflight_recovery_policy()
+        self.state.mkdir(mode=0o700, exist_ok=True)
         with self._locked():
             with self._db() as db:
                 db.execute("CREATE TABLE IF NOT EXISTS receipts (request_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT NOT NULL)")
@@ -83,7 +86,8 @@ class VaultStore:
         return self._git_run(*args, **kwargs).stdout
 
     def _git_run(self, *args: str, data: bytes | None = None, index: Path | None = None,
-                 cwd: Path | None = None, allowed_codes: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess:
+                 cwd: Path | None = None, allowed_codes: tuple[int, ...] = (0,),
+                 operator_config: bool = False) -> subprocess.CompletedProcess:
         env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         env.update({
             "GIT_AUTHOR_NAME": "VaultWrite", "GIT_AUTHOR_EMAIL": "vaultwrite@localhost",
@@ -91,7 +95,7 @@ class VaultStore:
             "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": os.devnull,
         })
-        if args and args[0] in ("push", "fetch") and cwd is None:
+        if (operator_config or (args and args[0] in ("push", "fetch"))) and cwd is None:
             # Git authentication and URL aliases often live in the user's config.
             env.pop("GIT_CONFIG_GLOBAL")
             for name in ("GIT_CONFIG_GLOBAL", "GIT_ASKPASS", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_SSH_VARIANT"):
@@ -156,6 +160,50 @@ class VaultStore:
         if current.exists() and not current.is_file():
             raise VaultError("INVALID_PATH", "The target must be a regular file.")
         return current
+
+    def _check_write_paths(self, names) -> None:
+        if not (self.settings.write_policy.allow_paths or self.settings.write_policy.deny_paths):
+            return
+        from .policy import permits
+        # Check the complete affected set before the caller changes anything.
+        for name in names:
+            self._path(name)
+            if not permits(self.settings.write_policy, name):
+                raise VaultError("PATH_PROTECTED", "The current write policy protects an affected path; no new operation was applied. For blocked recovery, preserve state and restore an allowing policy before restarting.", path=name)
+
+    def _preflight_recovery_policy(self) -> None:
+        if not (self.settings.write_policy.allow_paths or self.settings.write_policy.deny_paths):
+            return
+        try:
+            fd = os.open(self.journal, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            return
+        except OSError:
+            raise VaultError("RECOVERY_REQUIRED", "Cannot inspect pending journal safely; preserve state and run doctor.") from None
+        try:
+            with os.fdopen(fd, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_size > 64 * 1024 * 1024:
+                    raise ValueError("Invalid journal")
+                txn = json.load(stream)
+            if not isinstance(txn, dict):
+                raise ValueError("Invalid journal")
+            kind = txn.get("kind")
+            if kind == "sync_checkout":
+                # These rules protect explicit write APIs, not Git synchronization.
+                return
+            if kind in ("move_note", "batch_commit"):
+                entries = txn["entries"]
+                if not isinstance(entries, list) or not entries:
+                    raise ValueError("Invalid journal entries")
+                names = [entry["path"] for entry in entries]
+            elif kind in (None, "pending_write"):
+                names = [txn["path"]]
+            else:
+                raise ValueError("Unknown journal")
+        except (ValueError, KeyError, TypeError, UnicodeError, OSError, RecursionError):
+            raise VaultError("RECOVERY_REQUIRED", "Cannot inspect pending journal safely; preserve state and run doctor.") from None
+        self._check_write_paths(names)
 
     def _read(self, path: Path) -> bytes | None:
         try:
@@ -307,6 +355,7 @@ class VaultStore:
         """Overridden by failure-injection tests; no runtime bypass or failpoint."""
 
     def _recover(self) -> None:
+        self._preflight_recovery_policy()
         self._cleanup_atomic_files()
         if not self.journal.exists():
             return
@@ -361,12 +410,14 @@ class VaultStore:
             return {"path": path, "exists": data is not None, "version": version(data), **read_range(data, start_line, max_lines)}
 
     def find_note(self, path: str, text: str, start_line: int = 1, max_matches: int = 10,
-                  context_before: int = 0, context_after: int = 0) -> dict:
+                  context_before: int = 0, context_after: int = 0, compact: bool = False) -> dict:
         from .editing import find_lines
         with self._locked():
             self._recover()
             data = self._read(self._path(path))
-            return {"path": path, "exists": data is not None, "version": version(data), **find_lines(data, text, start_line, max_matches, context_before, context_after)}
+            return {"path": path, "exists": data is not None, "version": version(data), **find_lines(
+                data, text, start_line, max_matches, context_before, context_after, compact,
+            )}
 
     def preview_move_note(self, source: str, destination: str) -> dict:
         from .moving import preview_move_note
@@ -439,6 +490,8 @@ class VaultStore:
             arguments.append(result_options)
         fingerprint = hashlib.sha256(json.dumps(arguments, ensure_ascii=True).encode()).hexdigest()
         with self._locked():
+            self._path(path)
+            self._check_write_paths([path])
             self._recover()
             if self.settings.sync.enabled:
                 from .sync import validate_branch
@@ -529,18 +582,24 @@ class VaultStore:
                     raise VaultError("RECOVERY_REQUIRED", "A transaction is pending; retry the same request_id after resolving the Git/filesystem error.", reason=str(recovery_error)) from exc
             return result
 
-    def note_history(self, path: str, limit: int = 20) -> dict:
+    def note_history(self, path: str, limit: int = 20, follow_renames: bool = False) -> dict:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise VaultError("INVALID_LIMIT", "limit must be between 1 and 100.")
+        if type(follow_renames) is not bool:
+            raise VaultError("INVALID_HISTORY", "follow_renames must be a boolean.")
         with self._locked():
             self._recover()
             self._path(path)
-            output = self._git("log", f"-{limit}", "--format=%H%x00%at%x00%s", "--", path).decode()
+            options = ["--follow"] if follow_renames else []
+            output = self._git("log", f"-{limit}", *options, "--format=%H%x00%at%x00%s", "--", path).decode()
             commits = []
             for line in output.splitlines():
                 commit, timestamp, subject = line.split("\0", 2)
                 commits.append({"commit": commit, "timestamp": int(timestamp), "subject": subject})
-            return {"path": path, "commits": commits}
+            result = {"path": path, "commits": commits}
+            if follow_renames:
+                result["rename_following"] = "git_similarity_heuristic"
+            return result
 
 
 def init_vault(root: str | Path) -> Path:

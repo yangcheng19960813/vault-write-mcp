@@ -172,20 +172,46 @@ def test_recovery_protects_external_modification(pair):
 
 def test_push_main_race_retries_without_loss(pair, monkeypatch):
     remote, main, writer = pair
-    write(writer, "agent.md", "agent", "agent")
+    writer_commit = write(writer, "agent.md", "agent", "agent")["commit"]
     original = writer._git
-    advanced = []
+    advanced, hook_events, fixture_errors = [], [], []
     def race(*args, **kwargs):
         if args[0] == "push" and args[-1].endswith(":refs/heads/main") and not advanced:
-            write(main, "race.md", "race", "race")
-            publish(main)
-            advanced.append(main._head())
+            hook_events.append("entered")
+            fixture_step = "main_write"
+            hook_events.append("main_write_started")
+            try:
+                write(main, "race.md", "race", "race")
+                hook_events.append("main_written")
+                fixture_step = "main_publish"
+                publish(main)
+                hook_events.append("main_published")
+                fixture_step = "main_head"
+                advanced.append(main._head())
+            except VaultError as exc:
+                # Only synthetic local fixture paths/content are involved.
+                # sync deliberately sanitizes caught errors; keep this fixture
+                # error separately so it cannot masquerade as push rejection.
+                fixture_errors.append({"step": fixture_step, **exc.as_dict()})
+                raise
         return original(*args, **kwargs)
     monkeypatch.setattr(writer, "_git", race)
-    assert writer.sync()["state"] == "error"
+    result = writer.sync()
+    diagnostic = {"sync": result, "hook_events": hook_events, "fixture_errors": fixture_errors}
+    assert result["state"] == "error", diagnostic
+    assert result["stage"] == "push_main", diagnostic
+    assert result["error_code"] == "GIT_ERROR", diagnostic
+    assert hook_events == ["entered", "main_write_started", "main_written", "main_published"], diagnostic
+    assert len(advanced) == 1, diagnostic
+    assert not result["published"] and not result["applied"], diagnostic
+    assert writer._head() == writer_commit
     assert git(remote, "rev-parse", "main") == advanced[0]
-    assert writer.sync()["state"] == "synced"
+    assert git(remote, "rev-parse", "ubuntu") == writer_commit
+    retry = writer.sync()
+    assert retry["state"] == "synced", retry
+    assert retry["published"] and retry["applied"], retry
     assert writer.read_note("race.md")["content"] == "race"
+    assert writer.read_note("agent.md")["content"] == "agent"
 
 
 @pytest.mark.parametrize("external", ["staged", "untracked", "dirty", "symlink"])

@@ -29,6 +29,7 @@ from .editing import LineEdit, MAX_CONTEXT_DISTANCE
 
 ContextDistance = Annotated[int, Field(strict=True, ge=0, le=MAX_CONTEXT_DISTANCE)]
 ReturnContext = Annotated[bool, Field(strict=True)]
+CompactMatches = Annotated[bool, Field(strict=True)]
 
 
 class BearerAuth:
@@ -97,10 +98,11 @@ def create_app(store: VaultStore, token: str, host: str = "127.0.0.1", port: int
 
     @mcp.tool()
     async def find_note(path: str, text: str, start_line: int = 1, max_matches: int = 10,
-                        context_before: ContextDistance = 0, context_after: ContextDistance = 0) -> CallToolResult:
-        """Find literal, case-sensitive text in one note; return matching line:hash|text and the whole-note version. Optional before/after (0–50) add merged context windows, bounded to 200 window lines and 16 KiB of rendered lines including matches. context_truncated marks omitted context. Continue matching at next_line; context does not advance it. No regex/model calls."""
+                        context_before: ContextDistance = 0, context_after: ContextDistance = 0,
+                        compact: CompactMatches = False) -> CallToolResult:
+        """Find literal, case-sensitive text in one note and return the whole-note version. Optional before/after (0–50) add merged context windows, bounded to 200 window lines and 16 KiB of rendered lines including matches. compact=true is opt-in: returns each rendered line once in windows, with matches as {line, window_index, line_index} references; it also returns zero-context match lines. Every match in the page remains represented. context_truncated marks omitted context. Continue matching at next_line; context does not advance it. No regex/model calls."""
         return await invoke(store.find_note, path=path, text=text, start_line=start_line, max_matches=max_matches,
-                            context_before=context_before, context_after=context_after)
+                            context_before=context_before, context_after=context_after, compact=compact)
 
     @mcp.tool()
     async def write_note(path: str, content: str, expected_version: str, request_id: str, actor: str) -> CallToolResult:
@@ -133,9 +135,9 @@ def create_app(store: VaultStore, token: str, host: str = "127.0.0.1", port: int
                             plan_version=plan_version, request_id=request_id, actor=actor)
 
     @mcp.tool()
-    async def note_history(path: str, limit: int = 20) -> CallToolResult:
-        """List up to 100 Git commits affecting a Markdown note, newest first."""
-        return await invoke(store.note_history, path=path, limit=limit)
+    async def note_history(path: str, limit: int = 20, follow_renames: ReturnContext = False) -> CallToolResult:
+        """List up to 100 Git commits affecting a Markdown note, newest first. Optional follow_renames uses Git similarity heuristics, not authoritative identity."""
+        return await invoke(store.note_history, path=path, limit=limit, follow_renames=follow_renames)
 
     @mcp.tool()
     async def sync_status() -> CallToolResult:
@@ -178,12 +180,19 @@ def main() -> None:
         command = subparsers.add_parser(name, help=help_text)
         command.add_argument("--vault", required=True)
         command.add_argument("--config", help="Use the same TOML configuration as serve.")
+    diagnostic = subparsers.add_parser("doctor", help="Read-only bounded recovery diagnostics; never opens a VaultStore or recovers.")
+    diagnostic.add_argument("--vault", required=True)
+    diagnostic.add_argument("--config", help="Optional write policy to inspect; never authorizes recovery.")
     args = parser.parse_args()
     try:
         if args.command == "init":
             print(init_vault(args.vault))
             return
         settings = load_settings(args.config)
+        if args.command == "doctor":
+            from .diagnostics import doctor
+            print(json.dumps(doctor(args.vault, settings), ensure_ascii=False))
+            return
         if args.command in ("sync", "sync-status"):
             store = VaultStore(args.vault, settings)
             result = store.sync() if args.command == "sync" else store.sync_status()

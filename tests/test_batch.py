@@ -257,3 +257,97 @@ def test_push_rejects_remote_divergence_without_force(store, tmp_path):
         configured.push()
     assert git(bare, "rev-parse", "refs/heads/main") == advanced
     assert json.loads((configured.state / "push.json").read_text())["head"] == initial
+
+
+def remote(store, path, name="origin"):
+    subprocess.run(["git", "init", "--bare", str(path)], check=True, capture_output=True)
+    git(store.root, "remote", "add", name, str(path))
+    return VaultStore(store.root, replace(INTERVAL, push=PushConfig(enabled=True, remote=name)))
+
+
+def test_push_checkpoint_changes_when_same_named_remote_changes(store, tmp_path):
+    first, second = tmp_path / "first.git", tmp_path / "second.git"
+    configured = remote(store, first)
+    subprocess.run(["git", "init", "--bare", str(second)], check=True, capture_output=True)
+    assert configured.push()["pushed"]
+    before = json.loads((store.state / "push.json").read_text())
+    git(store.root, "remote", "set-url", "origin", str(second))
+    assert configured.push()["pushed"]
+    assert git(second, "rev-parse", "refs/heads/main") == configured._head()
+    assert json.loads((store.state / "push.json").read_text())["destination_digest"] != before["destination_digest"]
+    assert not configured.push()["pushed"]
+
+
+def test_push_identity_uses_all_pushurls_not_fetch_url(store, tmp_path):
+    configured = remote(store, tmp_path / "fetch.git")
+    first, second = tmp_path / "push-one.git", tmp_path / "push-two.git"
+    for path in (first, second):
+        subprocess.run(["git", "init", "--bare", str(path)], check=True, capture_output=True)
+    git(store.root, "config", "--add", "remote.origin.pushurl", str(first))
+    configured.push()
+    git(store.root, "remote", "set-url", "origin", "unused-fetch-url")
+    assert not configured.push()["pushed"]
+    git(store.root, "config", "--add", "remote.origin.pushurl", str(second))
+    assert configured.push()["pushed"]
+    assert git(second, "rev-parse", "refs/heads/main") == configured._head()
+    checkpoint = (store.state / "push.json").read_text()
+    assert str(first) not in checkpoint and str(second) not in checkpoint
+    git(store.root, "config", "--unset-all", "remote.origin.pushurl")
+    for path in (second, first):
+        git(store.root, "config", "--add", "remote.origin.pushurl", str(path))
+    assert not configured.push()["pushed"]
+
+
+def test_push_expanded_operator_alias_change_invalidates_checkpoint(store, tmp_path, monkeypatch):
+    configured = remote(store, tmp_path / "first.git")
+    second = tmp_path / "second.git"
+    subprocess.run(["git", "init", "--bare", str(second)], check=True, capture_output=True)
+    config = store.root / ".git/aliases"
+    git(store.root, "remote", "set-url", "origin", "test-alias")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    for destination in (tmp_path / "first.git", second):
+        config.write_text(f'[url "{destination}"]\n    pushInsteadOf = test-alias\n')
+        assert configured.push()["pushed"]
+    assert git(second, "rev-parse", "refs/heads/main") == configured._head()
+
+
+def test_push_old_or_malformed_checkpoint_and_branch_changes_recheck(store, tmp_path):
+    configured = remote(store, tmp_path / "remote.git")
+    for saved in ('{"head":"legacy"}', 'not JSON'):
+        (store.state / "push.json").write_text(saved)
+        assert configured.push()["pushed"]
+    changed = VaultStore(store.root, replace(configured.settings, push=PushConfig(enabled=True, branch="other")))
+    assert changed.push()["pushed"]
+    assert git(tmp_path / "remote.git", "rev-parse", "refs/heads/other") == configured._head()
+
+
+def test_push_failure_never_exposes_remote_credentials_or_replaces_checkpoint(store, tmp_path, monkeypatch, caplog):
+    configured = remote(store, tmp_path / "remote.git")
+    configured.push()
+    previous = (store.state / "push.json").read_bytes()
+    original = configured._git
+    secret_url = "https://private-user:private-token@private.invalid/vault.git"
+    def fail(*args, **kwargs):
+        if args[:2] == ("remote", "get-url"):
+            return (secret_url + "\n").encode()
+        if args[0] == "push":
+            raise VaultError("GIT_ERROR", secret_url)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(configured, "_git", fail)
+    with pytest.raises(VaultError) as caught:
+        configured.push()
+    assert "private" not in json.dumps(caught.value.as_dict()) + caplog.text
+    assert (store.state / "push.json").read_bytes() == previous
+    monkeypatch.setattr(configured, "_git", original)
+    assert not configured.push()["pushed"]
+
+
+def test_push_rejects_ambiguous_control_delimited_destinations_without_leak(store, tmp_path):
+    configured = remote(store, tmp_path / "remote.git")
+    configured.push()
+    previous = (store.state / "push.json").read_bytes()
+    git(store.root, "remote", "set-url", "origin", "private-secret\nother-destination")
+    with pytest.raises(VaultError) as caught:
+        configured.push()
+    assert "private-secret" not in str(caught.value)
+    assert (store.state / "push.json").read_bytes() == previous
